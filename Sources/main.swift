@@ -1,0 +1,1268 @@
+// MacSnow — menu bar snow that lands and piles up on window tops and the Dock.
+import AppKit
+import QuartzCore
+
+/// Size scale so things read like the reel on large displays (1.0 on a ~900pt-tall screen).
+let S: CGFloat = {
+    let h = NSScreen.screens.first?.frame.height ?? 900
+    return max(1, min(1.8, h / 900))
+}()
+
+// MARK: - Settings
+
+enum Intensity: Int, CaseIterable {
+    case light = 0, normal, heavy
+    var title: String { ["약하게 (Light)", "보통 (Normal)", "많이 (Heavy)"][rawValue] }
+    /// flakes per second per 100pt of screen width
+    var flakeRate: CGFloat { [0.6, 1.4, 2.8][rawValue] }
+}
+
+final class Settings {
+    static let shared = Settings()
+    private let d = UserDefaults.standard
+    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true]) }
+    var snowOn: Bool { get { d.bool(forKey: "snowOn") } set { d.set(newValue, forKey: "snowOn") } }
+    var snowmenOn: Bool { get { d.bool(forKey: "snowmenOn") } set { d.set(newValue, forKey: "snowmenOn") } }
+    var autoPlow: Bool { get { d.bool(forKey: "autoPlow") } set { d.set(newValue, forKey: "autoPlow") } }
+    var intensity: Intensity {
+        get { Intensity(rawValue: d.integer(forKey: "intensity")) ?? .normal }
+        set { d.set(newValue.rawValue, forKey: "intensity") }
+    }
+}
+
+// MARK: - Window list
+
+struct Win {
+    let id: CGWindowID
+    let frame: CGRect      // AppKit global coordinates (y up)
+    let z: Int             // 0 = frontmost
+    let surface: Bool      // normal window (layer 0): snow lands on it; floating ones only hide snow
+}
+
+enum WindowList {
+    static func fetch() -> [Win] {
+        guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        let me = ProcessInfo.processInfo.processIdentifier
+        var out: [Win] = []
+        let screenArea = NSScreen.screens.map { $0.frame.width * $0.frame.height }.max() ?? 1
+        for info in raw {
+            let layer = info[kCGWindowLayer as String] as? Int ?? -1
+            guard layer >= 0, layer < 20,
+                  (info[kCGWindowOwnerPID as String] as? Int32) != me,
+                  let b = info[kCGWindowBounds as String] as? [String: CGFloat],
+                  let id = info[kCGWindowNumber as String] as? CGWindowID else { continue }
+            if let a = info[kCGWindowAlpha as String] as? CGFloat, a < 0.1 { continue }
+            let w = b["Width"] ?? 0, h = b["Height"] ?? 0
+            guard w >= 80, h >= 50 else { continue }
+            let x = b["X"] ?? 0, y = b["Y"] ?? 0
+            if layer > 0 && w * h > screenArea * 0.8 { continue }   // full-screen helper overlays
+            out.append(Win(id: id, frame: CGRect(x: x, y: primaryH - y - h, width: w, height: h), z: out.count, surface: layer == 0))
+        }
+        return out
+    }
+}
+
+// MARK: - Dock geometry (estimated; the Dock exposes no public frame)
+
+enum DockGeometry {
+    private static var cache: [ObjectIdentifier: ((CGFloat, CGFloat, CGFloat)?, CFTimeInterval)] = [:]
+    static func invalidate() { cache.removeAll() }
+    /// (minX, maxX, topY) in global coords for a screen whose Dock sits at the bottom.
+    static func span(for screen: NSScreen) -> (CGFloat, CGFloat, CGFloat)? {
+        let key = ObjectIdentifier(screen)
+        let now = CACurrentMediaTime()
+        if let c = cache[key], now - c.1 < 30 { return c.0 }   // also invalidated on app launch/quit
+        let v = compute(screen)
+        cache[key] = (v, now)
+        return v
+    }
+    private static func compute(_ screen: NSScreen) -> (CGFloat, CGFloat, CGFloat)? {
+        let f = screen.frame, v = screen.visibleFrame
+        guard v.minY - f.minY > 20 else { return nil }          // hidden or on the side
+        let dock = UserDefaults(suiteName: "com.apple.dock")
+        let ts = CGFloat(dock?.double(forKey: "tilesize") ?? 0)
+        let tile = ts > 0 ? ts : 48
+        let apps = (dock?.array(forKey: "persistent-apps") as? [[String: Any]]) ?? []
+        var ids = Set<String>()
+        for a in apps {
+            if let td = a["tile-data"] as? [String: Any], let b = td["bundle-identifier"] as? String { ids.insert(b.lowercased()) }
+        }
+        var extra = 0
+        for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+            let b = app.bundleIdentifier?.lowercased() ?? ""
+            if b != "com.apple.finder", !ids.contains(b) { extra += 1 }
+        }
+        let others = ((dock?.array(forKey: "persistent-others")) ?? []).count
+        let showRecents = dock?.object(forKey: "show-recents") as? Bool ?? true
+        let icons = 1 + apps.count + extra + others + 1 + (showRecents ? 3 : 0)
+        let seps = 1 + (showRecents ? 1 : 0)
+        var width = CGFloat(icons) * tile + CGFloat(seps) * tile * 0.3 + tile * 0.35
+        width = min(width, f.width - 8)
+        return (f.midX - width / 2, f.midX + width / 2, v.minY - 4)
+    }
+}
+
+// MARK: - Snow pile height map
+
+final class Pile {
+    static let step: CGFloat = 3
+    static let maxH: CGFloat = 13 * S
+    static let kernel: [CGFloat] = (-5...5).map { exp(-CGFloat($0 * $0) / 8) }
+    var dirty = true
+    var heights: [CGFloat] = []
+    var caps: [CGFloat] = []
+    var lastSeen = Date()
+    private let ph1 = CGFloat.random(in: 0...6.28), ph2 = CGFloat.random(in: 0...6.28)
+    /// soft rounded lumps rather than a flat slab
+    private func cap(_ i: Int) -> CGFloat {
+        let x = CGFloat(i)
+        return Pile.maxH * (0.8 + 0.1 * sin(x * 0.17 + ph1) + 0.07 * sin(x * 0.47 + ph2) + CGFloat.random(in: -0.02...0.03))
+    }
+
+    func resize(width: CGFloat) {
+        let n = max(2, Int(width / Pile.step) + 1)
+        if heights.count == n { return }
+        if heights.count > n { heights.removeLast(heights.count - n); caps.removeLast(caps.count - n) }
+        while heights.count < n {
+            heights.append(0)
+            caps.append(cap(heights.count - 1))
+        }
+    }
+    /// add `area` pt² of snow around local x
+    func deposit(at x: CGFloat, area: CGFloat) {
+        let c = Int(x / Pile.step)
+        let amount = area / (4.99 * Pile.step)
+        for k in -5...5 {
+            let i = c + k
+            guard i >= 0, i < heights.count else { continue }
+            heights[i] = min(caps[i], heights[i] + amount * Pile.kernel[k + 5])
+        }
+        dirty = true
+    }
+    func fill() { for i in heights.indices { heights[i] = caps[i] * CGFloat.random(in: 0.92...1) }; dirty = true }
+    func relax() {
+        guard heights.count > 2 else { return }
+        var h = heights
+        for i in 1..<(h.count - 1) { h[i] += ((heights[i - 1] + heights[i + 1]) / 2 - heights[i]) * 0.15 }
+        heights = h
+        dirty = true
+    }
+    func height(at x: CGFloat) -> CGFloat {
+        let i = Int(x / Pile.step)
+        guard i >= 0, i < heights.count else { return 0 }
+        return heights[i]
+    }
+    func index(_ x: CGFloat) -> Int { Int(x / Pile.step) }
+    /// remove a fraction of the snow between two local x's; returns removed area (pt²)
+    func take(from x0: CGFloat, to x1: CGFloat, fraction: CGFloat) -> CGFloat {
+        let a = max(0, index(min(x0, x1))), b = min(heights.count - 1, index(max(x0, x1)))
+        guard a <= b else { return 0 }
+        var got: CGFloat = 0
+        for i in a...b { let t = heights[i] * fraction; heights[i] -= t; got += t * Pile.step }
+        dirty = true
+        return got
+    }
+    var mean: CGFloat { heights.isEmpty ? 0 : heights.reduce(0, +) / CGFloat(heights.count) }
+}
+
+struct Surface: Equatable {
+    let key: UInt64
+    let minX: CGFloat, maxX: CGFloat, top: CGFloat
+    let z: Int           // window z, or -1 for the Dock (above all windows)
+    var width: CGFloat { maxX - minX }
+}
+
+// MARK: - Drawing helpers
+
+func circle(_ c: CGPoint, _ r: CGFloat) -> CGPath { CGPath(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r), transform: nil) }
+
+func shape(_ p: CGPath, fill: NSColor, stroke: NSColor? = nil, lw: CGFloat = 0) -> CAShapeLayer {
+    let l = CAShapeLayer()
+    l.path = p; l.fillColor = fill.cgColor
+    l.strokeColor = stroke?.cgColor; l.lineWidth = lw
+    l.lineCap = .round
+    l.contentsScale = 2
+    return l
+}
+
+let snowEdge = NSColor(calibratedRed: 0.74, green: 0.81, blue: 0.92, alpha: 1)
+let santaRed = NSColor(calibratedRed: 0.86, green: 0.1, blue: 0.12, alpha: 1)
+
+/// Snowman with Santa hat and scarf, drawn at unit scale (base radius 9). Anchor = bottom centre.
+func makeSnowmanLayer() -> CALayer {
+    let root = CALayer()
+    root.bounds = CGRect(x: 0, y: 0, width: 40, height: 52)
+    root.anchorPoint = CGPoint(x: 0.5, y: 0)
+    let stick = NSColor(calibratedRed: 0.42, green: 0.27, blue: 0.14, alpha: 1)
+    let arms = CGMutablePath()
+    arms.move(to: CGPoint(x: 13, y: 22)); arms.addLine(to: CGPoint(x: 4, y: 28))
+    arms.move(to: CGPoint(x: 6.5, y: 26.5)); arms.addLine(to: CGPoint(x: 4, y: 25))
+    arms.move(to: CGPoint(x: 27, y: 22)); arms.addLine(to: CGPoint(x: 36, y: 28))
+    arms.move(to: CGPoint(x: 33.5, y: 26.5)); arms.addLine(to: CGPoint(x: 36, y: 25))
+    root.addSublayer(shape(arms, fill: .clear, stroke: stick, lw: 1.4))
+    root.addSublayer(shape(circle(CGPoint(x: 20, y: 9), 9), fill: .white, stroke: snowEdge, lw: 0.8))
+    root.addSublayer(shape(circle(CGPoint(x: 20, y: 22.5), 7), fill: .white, stroke: snowEdge, lw: 0.8))
+    root.addSublayer(shape(circle(CGPoint(x: 20, y: 33.5), 5.6), fill: .white, stroke: snowEdge, lw: 0.8))
+    for y in [20.0, 24.0] { root.addSublayer(shape(circle(CGPoint(x: 20, y: y), 0.9), fill: .black)) }
+    let scarf = CGMutablePath()
+    scarf.addRoundedRect(in: CGRect(x: 14, y: 27, width: 12, height: 3), cornerWidth: 1.4, cornerHeight: 1.4)
+    scarf.addRoundedRect(in: CGRect(x: 22, y: 19.5, width: 3, height: 9), cornerWidth: 1.2, cornerHeight: 1.2)
+    root.addSublayer(shape(scarf, fill: santaRed))
+    root.addSublayer(shape(circle(CGPoint(x: 18, y: 35), 0.8), fill: .black))
+    root.addSublayer(shape(circle(CGPoint(x: 22, y: 35), 0.8), fill: .black))
+    let nose = CGMutablePath()
+    nose.move(to: CGPoint(x: 20, y: 33.7)); nose.addLine(to: CGPoint(x: 25, y: 32.6)); nose.addLine(to: CGPoint(x: 20, y: 32.4)); nose.closeSubpath()
+    root.addSublayer(shape(nose, fill: NSColor(calibratedRed: 1, green: 0.5, blue: 0.1, alpha: 1)))
+    let hat = CGMutablePath()
+    hat.move(to: CGPoint(x: 15, y: 38)); hat.addQuadCurve(to: CGPoint(x: 27, y: 46), control: CGPoint(x: 19, y: 48))
+    hat.addQuadCurve(to: CGPoint(x: 25, y: 38), control: CGPoint(x: 24, y: 42)); hat.closeSubpath()
+    root.addSublayer(shape(hat, fill: santaRed))
+    let brim = CGMutablePath(); brim.addRoundedRect(in: CGRect(x: 14, y: 36.6, width: 12, height: 3), cornerWidth: 1.5, cornerHeight: 1.5)
+    root.addSublayer(shape(brim, fill: .white, stroke: snowEdge, lw: 0.5))
+    root.addSublayer(shape(circle(CGPoint(x: 27.2, y: 45.6), 1.9), fill: .white, stroke: snowEdge, lw: 0.5))
+    root.shadowColor = NSColor(calibratedRed: 0.2, green: 0.25, blue: 0.4, alpha: 1).cgColor
+    root.shadowOpacity = 0.35; root.shadowRadius = 1.5; root.shadowOffset = CGSize(width: 0, height: -1)
+    return root
+}
+
+func makeSnowballsLayer() -> CALayer {
+    let root = CALayer()
+    root.bounds = CGRect(x: 0, y: 0, width: 26, height: 12)
+    root.anchorPoint = CGPoint(x: 0, y: 0)
+    root.addSublayer(shape(circle(CGPoint(x: 6, y: 5), 5), fill: .white, stroke: snowEdge, lw: 0.7))
+    root.addSublayer(shape(circle(CGPoint(x: 18, y: 6), 6), fill: .white, stroke: snowEdge, lw: 0.7))
+    return root
+}
+
+/// One snowball drawn at radius 20 (scale it), anchor = centre; speckles make rolling visible.
+func makeBallLayer() -> CALayer {
+    let root = CALayer()
+    root.bounds = CGRect(x: 0, y: 0, width: 40, height: 40)
+    root.addSublayer(shape(circle(CGPoint(x: 20, y: 20), 19.5), fill: .white, stroke: snowEdge, lw: 1.2))
+    let dots = CGMutablePath()
+    for (x, y, r) in [(12.0, 26.0, 1.6), (27.0, 13.0, 1.4), (24.0, 28.0, 1.1), (14.0, 12.0, 1.0), (30.0, 22.0, 0.9)] {
+        dots.addPath(circle(CGPoint(x: x, y: y), r))
+    }
+    root.addSublayer(shape(dots, fill: NSColor(calibratedRed: 0.72, green: 0.79, blue: 0.9, alpha: 1)))
+    let arc = CGMutablePath(); arc.addArc(center: CGPoint(x: 20, y: 20), radius: 13, startAngle: 2.2, endAngle: 3.4, clockwise: false)
+    root.addSublayer(shape(arc, fill: .clear, stroke: NSColor(calibratedRed: 0.8, green: 0.86, blue: 0.94, alpha: 1), lw: 1.2))
+    root.shadowColor = NSColor(calibratedRed: 0.2, green: 0.25, blue: 0.4, alpha: 1).cgColor
+    root.shadowOpacity = 0.3; root.shadowRadius = 1.5; root.shadowOffset = CGSize(width: 0, height: -1)
+    return root
+}
+
+/// Pixel-art snowplow facing right. Anchor = bottom centre. Returns (layer, blade height).
+func makePlowLayer(px: CGFloat) -> (CALayer, CGFloat) {
+    let art = [
+        "................................",
+        "................................",
+        "................................",
+        "...........YYYYYYYYY............",
+        "..........YYBBBBBBBYY...........",
+        "......G...YYBLLBBBBYY...........",
+        "......K...YYBLBBBBBYY...........",
+        "......K...YYBBBBBBBYY.......SSS.",
+        "......K...YYBBBBBBBYY.......SSS.",
+        "......K...YYYYYYYYYYY......GSS..",
+        "....YYYYYYYYYYYYYYYYYYYYY..GSS..",
+        "...YYYYYYYYYYYYYYYYYYYYYYY.GSS..",
+        "...YYYYYYYYYYYYYYYYYYYYYYGGGSS..",
+        "...DDDDDDDDDDDDDDDDDDDDDDGGGSS..",
+        "...YYYYYYYYYYYYYYYYYYYYYYY.GSS..",
+        "...YDDDDDDDDDDDDDDDDDDDDDY.GSS..",
+        "...KKKKKKKKKKKKKKKKKKKKKKK.GSS..",
+        "..KKWWWKKWWWKKWWWKKWWWKKKKKGSS..",
+        "..KKWGWKKWGWKKWGWKKWGWKKKKKGSS..",
+        "..KKWGWKKWGWKKWGWKKWGWKKKKKGSS..",
+        "..KKWWWKKWWWKKWWWKKWWWKKKKK.SSS.",
+        "...KKKKKKKKKKKKKKKKKKKKKKK..SSS.",
+    ]
+    let colors: [Character: NSColor] = [
+        "Y": NSColor(calibratedRed: 1, green: 0.82, blue: 0.12, alpha: 1),
+        "D": NSColor(calibratedRed: 0.88, green: 0.6, blue: 0.05, alpha: 1),
+        "B": NSColor(calibratedRed: 0.5, green: 0.78, blue: 0.95, alpha: 1),
+        "L": NSColor(calibratedRed: 0.86, green: 0.95, blue: 1, alpha: 1),
+        "G": NSColor(calibratedWhite: 0.55, alpha: 1),
+        "K": NSColor(calibratedWhite: 0.22, alpha: 1),
+        "W": NSColor(calibratedWhite: 0.68, alpha: 1),
+        "S": NSColor(calibratedWhite: 0.76, alpha: 1),
+    ]
+    let cols = art[0].count, rows = art.count
+    let img = NSImage(size: NSSize(width: cols, height: rows), flipped: true) { _ in
+        for (r, row) in art.enumerated() {
+            for (c, ch) in row.enumerated() {
+                guard let col = colors[ch] else { continue }
+                col.setFill()
+                NSRect(x: c, y: r, width: 1, height: 1).fill()
+            }
+        }
+        return true
+    }
+    let w = CGFloat(cols) * px, h = CGFloat(rows) * px
+    let root = CALayer()
+    root.bounds = CGRect(x: 0, y: 0, width: w, height: h)
+    root.anchorPoint = CGPoint(x: 0.5, y: 0)
+    root.contents = img.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    root.magnificationFilter = .nearest
+    root.contentsGravity = .resize
+    // flashing orange beacon on the cab roof (rows 1-2, cols 14-16)
+    let light = CALayer()
+    light.frame = CGRect(x: 14 * px, y: h - 3 * px, width: 3 * px, height: 2 * px)
+    light.backgroundColor = NSColor(calibratedRed: 1, green: 0.45, blue: 0.0, alpha: 1).cgColor
+    light.cornerRadius = px * 0.6
+    light.shadowColor = light.backgroundColor; light.shadowOpacity = 0.9; light.shadowRadius = 4; light.shadowOffset = .zero
+    let blink = CABasicAnimation(keyPath: "opacity")
+    blink.fromValue = 1; blink.toValue = 0.15; blink.duration = 0.35
+    blink.autoreverses = true; blink.repeatCount = .infinity
+    light.add(blink, forKey: "blink")
+    root.addSublayer(light)
+    return (root, 15 * px)
+}
+
+// MARK: - Overlay per screen
+
+final class Overlay {
+    let screen: NSScreen
+    let window: NSWindow
+    let root: CALayer
+    let piles = CALayer()
+    let actors = CALayer()
+    let flakeRoot = CALayer()
+
+    init(screen: NSScreen) {
+        self.screen = screen
+        window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true                  // click-through: every click reaches the real window
+        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1) // above Dock, below menu bar & menus
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        window.isReleasedWhenClosed = false
+        let view = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        view.wantsLayer = true
+        root = view.layer!
+        window.contentView = view
+        window.setFrame(screen.frame, display: false)
+
+        for l in [piles, actors, flakeRoot] as [CALayer] { l.frame = root.bounds; root.addSublayer(l) }
+        window.orderFrontRegardless()
+    }
+
+    func local(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x - screen.frame.minX, y: p.y - screen.frame.minY) }
+}
+
+/// Layers for one surface's snow: a blue-grey underside + white top, clipped by a mask.
+final class PileView {
+    let container = CALayer()
+    let under = CAShapeLayer()
+    let top = CAShapeLayer()
+    let mask = CAShapeLayer()
+    var width: CGFloat = -1
+    var occSig: [CGRect] = []
+    var needsPath = true
+    init() {
+        under.fillColor = NSColor(calibratedRed: 0.72, green: 0.79, blue: 0.9, alpha: 1).cgColor
+        under.shadowColor = NSColor(calibratedRed: 0.15, green: 0.22, blue: 0.4, alpha: 1).cgColor
+        under.shadowOpacity = 0.45
+        under.shadowRadius = 2
+        under.shadowOffset = CGSize(width: 0, height: -1.5)
+        top.fillColor = NSColor.white.cgColor
+        container.addSublayer(under)
+        container.addSublayer(top)
+    }
+}
+
+// MARK: - Actors
+
+/// A falling flake: Core Animation moves it (no per-frame CPU work); we only settle it on arrival.
+struct Flake {
+    let layer: CALayer
+    let arriveAt: CFTimeInterval
+    let key: UInt64?          // surface it lands on (nil = falls off the bottom)
+    let localX: CGFloat
+    let area: CGFloat
+}
+
+/// A snowman or a snowball sitting on a surface.
+final class Prop {
+    enum Kind { case snowman, ball }
+    let kind: Kind
+    let layer: CALayer
+    let deco: CALayer?
+    var scale: CGFloat
+    var host: UInt64?
+    var localX: CGFloat = 0
+    var pos = CGPoint.zero     // global, bottom centre
+    var vy: CGFloat = 0
+    var grounded = false
+    let decoSide: CGFloat = Bool.random() ? 1 : -1
+    weak var parent: CALayer?
+
+    init(kind: Kind, scale: CGFloat, withBalls: Bool = false) {
+        self.kind = kind; self.scale = scale
+        layer = kind == .snowman ? makeSnowmanLayer() : makeBallLayer()
+        deco = withBalls ? makeSnowballsLayer() : nil
+        let k = kind == .snowman ? scale : scale / 20
+        layer.setAffineTransform(CGAffineTransform(scaleX: k, y: k))
+        deco?.setAffineTransform(CGAffineTransform(scaleX: S, y: S))
+    }
+    var height: CGFloat { kind == .snowman ? 50 * scale : 2 * scale }
+    var halfWidth: CGFloat { kind == .snowman ? 13 * scale : scale }
+    func remove() { layer.removeFromSuperlayer(); deco?.removeFromSuperlayer() }
+}
+
+final class Plow {
+    let layer: CALayer
+    let bladeH: CGFloat
+    let mound = CAShapeLayer()
+    var screenIndex: Int
+    var x: CGFloat
+    var lastFront: CGFloat
+    var volume: CGFloat = 0
+    init(screenIndex: Int, x: CGFloat) {
+        (layer, bladeH) = makePlowLayer(px: 1.8 * S)
+        self.screenIndex = screenIndex; self.x = x
+        lastFront = x + layer.bounds.width / 2
+        mound.fillColor = NSColor.white.cgColor
+        mound.shadowColor = NSColor(calibratedRed: 0.3, green: 0.4, blue: 0.62, alpha: 1).cgColor
+        mound.shadowOpacity = 0.6; mound.shadowRadius = 1.8; mound.shadowOffset = CGSize(width: 0, height: -1)
+    }
+    var front: CGFloat { x + layer.bounds.width / 2 - 2 * S }
+}
+
+/// A snowball being rolled by a mouse drag along a pile.
+final class Roll {
+    let key: UInt64
+    let startMinX: CGFloat, startTop: CGFloat
+    var localX: CGFloat
+    var r: CGFloat = 3 * S
+    var angle: CGFloat = 0
+    var shown = false
+    let layer = makeBallLayer()
+    init(key: UInt64, surface s: Surface, localX: CGFloat) {
+        self.key = key; startMinX = s.minX; startTop = s.top; self.localX = localX
+    }
+}
+
+// MARK: - Engine
+
+final class Engine {
+    var overlays: [Overlay] = []
+    var piles: [UInt64: Pile] = [:]
+    var surfaces: [UInt64: Surface] = [:]
+    var segments: [UInt64: [(CGFloat, CGFloat)]] = [:]
+    var orderedSurfaces: [Surface] = []
+    var pileViews: [UInt64: PileView] = [:]
+    var wins: [Win] = []
+    var flakes: [Flake] = []
+    var props: [Prop] = []
+    var plows: [Plow] = []
+    var roll: Roll?
+    var timer: Timer?
+    var interval: Double = 0
+    var paused = false
+    var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+    var flakePool: [CALayer] = []
+    var lastPileDraw: CFTimeInterval = 0
+    var last = CACurrentMediaTime()
+    var lastPlow = CACurrentMediaTime()
+    var spawnDebt: CGFloat = 0
+    var pileDirty = true
+    var geometryChanged = true
+    var tickCount = 0
+    var demoBoost: CGFloat = 1
+    var mouseIsDown = false
+    var forceFast = false        // debug: behave as if the mouse were held (to measure drag cost)
+
+    static let snowmanThreshold: CGFloat = 9 * S     // ball radius that turns into a snowman
+    static let maxBall: CGFloat = 16 * S
+
+    func start() {
+        rebuildOverlays()
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            DockGeometry.invalidate()
+            self?.rebuildOverlays()
+        }
+        installMouseMonitors()
+        installPowerObservers()
+        updateRate()
+        if Engine.shouldSleep() { setPaused(true) }
+    }
+
+    /// Tick only as fast as needed: 60 Hz while the mouse is down (drag / rolling),
+    /// 30 Hz while something animates on the CPU side, 10 Hz (5 in Low Power) for snowfall,
+    /// 4 Hz when only resting snow has to follow windows, 1 Hz otherwise, and nothing while paused.
+    func desiredInterval() -> Double? {
+        if paused { return nil }
+        if mouseIsDown || forceFast { return 1.0 / 60 }
+        if roll != nil || !plows.isEmpty || props.contains(where: { !$0.grounded }) { return 1.0 / 30 }
+        if Settings.shared.snowOn || !flakes.isEmpty { return lowPower ? 1.0 / 4 : 1.0 / 8 }
+        if !props.isEmpty || piles.values.contains(where: { $0.mean > 0.05 }) { return 1.0 / 4 }
+        return 1.0
+    }
+
+    func updateRate() {
+        let want = desiredInterval()
+        if want == nil { timer?.invalidate(); timer = nil; interval = 0; return }
+        if timer != nil && want! == interval { return }
+        interval = want!
+        timer?.invalidate()
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
+        t.tolerance = interval * 0.2
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        last = CACurrentMediaTime()
+    }
+
+    /// Stop all work while displays sleep, the screen is locked or the session is switched out.
+    func installPowerObservers() {
+        let ws = NSWorkspace.shared.notificationCenter
+        for n in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
+            ws.addObserver(forName: n, object: nil, queue: .main) { _ in DockGeometry.invalidate() }   // Dock width changes
+        }
+        for (n, pause) in [(NSWorkspace.screensDidSleepNotification, true), (NSWorkspace.screensDidWakeNotification, false),
+                           (NSWorkspace.sessionDidResignActiveNotification, true), (NSWorkspace.sessionDidBecomeActiveNotification, false)] {
+            ws.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in self?.setPaused(pause) }
+        }
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.setPaused(true) }
+        dnc.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in self?.setPaused(false) }
+        NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [weak self] _ in
+            self?.lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+            self?.updateRate()
+        }
+    }
+
+    let noPause = ProcessInfo.processInfo.arguments.contains("--nopause")   // debug: measure CPU while locked
+
+    var pauseWatch: Timer?
+
+    /// Locked or all displays asleep, read directly (backup in case a wake/unlock notification is missed).
+    static func shouldSleep() -> Bool {
+        let locked = (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
+        return locked || CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+
+    func setPaused(_ p: Bool) {
+        guard p != paused, !noPause else { return }
+        paused = p
+        pauseWatch?.invalidate(); pauseWatch = nil
+        if p {
+            // every 2 s while paused: resume if we are actually unlocked and awake
+            pauseWatch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+                if !Engine.shouldSleep() { self?.setPaused(false) }
+            }
+            pauseWatch?.tolerance = 1
+        }
+        if p { dropAllFlakes() }
+        for o in overlays { o.root.speed = p ? 0 : 1 }   // freezes plow beacon etc. on the GPU side too
+        updateRate()
+    }
+
+    func dropAllFlakes() {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for f in flakes { f.layer.removeAllAnimations(); f.layer.removeFromSuperlayer(); flakePool.append(f.layer) }
+        CATransaction.commit()
+        flakes.removeAll()
+    }
+
+    func rebuildOverlays() {
+        for o in overlays { o.window.orderOut(nil) }
+        dropAllFlakes()
+        overlays = NSScreen.screens.map { Overlay(screen: $0) }
+        pileViews.removeAll()
+        for p in props { p.remove(); p.parent = nil }
+        for p in plows { p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer() }
+        plows.removeAll()
+        pileDirty = true
+    }
+
+    func applySettings() { if !Settings.shared.snowmenOn { removeAllProps() } }
+
+    func clearSnow() { piles.removeAll(); dropAllFlakes(); pileDirty = true; geometryChanged = true; removeAllProps() }
+    func removeAllProps() { props.forEach { $0.remove() }; props.removeAll() }
+
+    static func dockKey(_ i: Int) -> UInt64 { (1 << 40) + UInt64(i) }
+
+    // MARK: geometry
+
+    /// Full window list (~1 ms on a busy desktop). During a drag we only re-read the dragged
+    /// window every frame (refreshDragged) and do the full list ~8 times a second.
+    func refreshGeometry() {
+        applyWins(WindowList.fetch())
+    }
+
+    func refreshDragged() {
+        guard let d = downWin,
+              let raw = CGWindowListCopyWindowInfo(.optionIncludingWindow, d.id) as? [[String: Any]],
+              let b = raw.first?[kCGWindowBounds as String] as? [String: CGFloat] else { refreshGeometry(); return }
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        let h = b["Height"] ?? 0
+        let f = CGRect(x: b["X"] ?? 0, y: primaryH - (b["Y"] ?? 0) - h, width: b["Width"] ?? 0, height: h)
+        guard let i = wins.firstIndex(where: { $0.id == d.id }), wins[i].frame != f else { return }
+        var list = wins
+        list[i] = Win(id: d.id, frame: f, z: list[i].z, surface: list[i].surface)
+        applyWins(list)
+    }
+
+    func applyWins(_ list: [Win]) {
+        wins = list
+        var s: [UInt64: Surface] = [:]
+        for w in wins where w.surface {
+            s[UInt64(w.id)] = Surface(key: UInt64(w.id), minX: w.frame.minX, maxX: w.frame.maxX, top: w.frame.maxY, z: w.z)
+        }
+        for (i, o) in overlays.enumerated() {
+            if let (a, b, t) = DockGeometry.span(for: o.screen) {
+                s[Engine.dockKey(i)] = Surface(key: Engine.dockKey(i), minX: a, maxX: b, top: t, z: -1)
+            }
+        }
+        if s != surfaces {
+            surfaces = s
+            orderedSurfaces = s.values.sorted { $0.top > $1.top }
+            geometryChanged = true
+            segments = [:]
+            for (k, surf) in s {
+                segments[k] = visibleSegments(surf)
+                let pile = piles[k] ?? Pile()
+                piles[k] = pile
+                pile.resize(width: surf.width)
+            }
+        }
+        for k in surfaces.keys { piles[k]?.lastSeen = Date() }
+    }
+
+    /// x-intervals (global) of a surface's top band that aren't hidden by windows in front of it.
+    func visibleSegments(_ s: Surface) -> [(CGFloat, CGFloat)] {
+        var segs: [(CGFloat, CGFloat)] = [(s.minX, s.maxX)]
+        guard s.z >= 0 else { return segs }
+        for w in wins where w.z < s.z {
+            let f = w.frame
+            guard f.minY < s.top + Pile.maxH, f.maxY > s.top - 2 else { continue }
+            var next: [(CGFloat, CGFloat)] = []
+            for (a, b) in segs {
+                if f.maxX <= a || f.minX >= b { next.append((a, b)); continue }
+                if f.minX > a { next.append((a, f.minX)) }
+                if f.maxX < b { next.append((f.maxX, b)) }
+            }
+            segs = next
+            if segs.isEmpty { break }
+        }
+        return segs.filter { $0.1 - $0.0 > 2 }
+    }
+
+    func isVisible(_ k: UInt64, _ gx: CGFloat) -> Bool {
+        segments[k]?.contains { gx >= $0.0 && gx <= $0.1 } ?? false
+    }
+
+    // MARK: tick
+
+    func tick() {
+        tickCount += 1
+        let now = CACurrentMediaTime()
+        let dt = CGFloat(min(0.25, now - last))
+        last = now
+
+        // window bounds: mouse down -> the window under the cursor every frame (60 Hz) + full list
+        // ~8 Hz; otherwise the full list ~4 Hz whatever the tick rate
+        if mouseIsDown || forceFast {
+            if tickCount % 8 == 0 { refreshGeometry() } else { refreshDragged() }
+        } else if tickCount % max(1, Int(0.25 / max(interval, 0.001))) == 0 { refreshGeometry() }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        updateFlakes(dt: dt, now: now)
+        if tickCount % 10 == 0 { for p in piles.values where p.mean > 0.05 { p.relax() }; pileDirty = true }
+        if tickCount % 120 == 0 {
+            let cutoff = Date().addingTimeInterval(-3)
+            piles = piles.filter { surfaces[$0.key] != nil || $0.value.lastSeen > cutoff }
+        }
+        updatePlows(dt: dt, now: now)
+        updateProps(dt: dt)
+        updateRoll()
+        // pile paths: immediately when windows move, otherwise at most ~4 Hz for slow growth
+        if geometryChanged || (pileDirty && now - lastPileDraw > 0.4) {   // moves: cheap re-position
+            redrawPiles(); pileDirty = false; geometryChanged = false; lastPileDraw = now
+        }
+        CATransaction.commit()
+        updateRate()
+    }
+
+    // MARK: flakes
+
+    func updateFlakes(dt: CGFloat, now: CFTimeInterval) {
+        // settle the flakes that have arrived (their landing spot was chosen when they spawned)
+        if !flakes.isEmpty {
+            var kept: [Flake] = []
+            kept.reserveCapacity(flakes.count)
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            for f in flakes {
+                if now < f.arriveAt { kept.append(f); continue }
+                if let k = f.key, let pile = piles[k] {
+                    pile.deposit(at: f.localX, area: f.area)
+                    // --demo: extra flakes' worth of snow, spread nearby (keeps the profile smooth)
+                    for _ in 0..<Int(demoBoost) - 1 { pile.deposit(at: f.localX + .random(in: -60...60), area: f.area) }
+                    pileDirty = true
+                }
+                f.layer.removeAllAnimations(); f.layer.removeFromSuperlayer(); flakePool.append(f.layer)
+            }
+            CATransaction.commit()
+            flakes = kept
+        }
+        guard Settings.shared.snowOn else { return }
+        let rate = Settings.shared.intensity.flakeRate * (lowPower ? 0.5 : 1)
+        // highest surfaces first: a flake crossing a window top sticks with some chance, otherwise
+        // keeps falling in front of it to the windows / Dock further down (windows are layered).
+        let ordered = orderedSurfaces
+        for o in overlays {
+            let f = o.screen.frame
+            spawnDebt += rate * f.width / 100 * dt
+            while spawnDebt >= 1 {
+                spawnDebt -= 1
+                let x = CGFloat.random(in: f.minX...f.maxX)
+                let r = CGFloat.random(in: 1.3...2.7) * S
+                let v = CGFloat.random(in: 52...80) * (0.85 + 0.15 * S)
+                var endY = f.minY - 2 * r
+                var key: UInt64?
+                var lx: CGFloat = 0
+                for s in ordered where x >= s.minX && x <= s.maxX && s.top < f.maxY && s.top > f.minY {
+                    guard isVisible(s.key, x), s.z < 0 || CGFloat.random(in: 0..<1) < 0.45 else { continue }
+                    lx = x - s.minX
+                    endY = s.top + (piles[s.key]?.height(at: lx) ?? 0) + r * 0.3
+                    key = s.key
+                    break
+                }
+                let startY = f.maxY + r + 2
+                let dur = Double((startY - endY) / v)
+                let layer = flakePool.popLast() ?? {
+                    let l = CALayer()
+                    l.backgroundColor = NSColor.white.cgColor
+                    l.borderColor = NSColor(calibratedRed: 0.55, green: 0.62, blue: 0.75, alpha: 0.4).cgColor
+                    l.borderWidth = 0.5
+                    return l
+                }()
+                CATransaction.begin(); CATransaction.setDisableActions(true)
+                layer.bounds = CGRect(x: 0, y: 0, width: 2 * r, height: 2 * r)
+                layer.cornerRadius = r
+                layer.position = CGPoint(x: x - f.minX, y: endY - f.minY)
+                o.flakeRoot.addSublayer(layer)
+                CATransaction.commit()
+                let a = CABasicAnimation(keyPath: "position.y")
+                a.fromValue = startY - f.minY
+                a.toValue = endY - f.minY
+                a.duration = dur
+                layer.add(a, forKey: "fall")
+                flakes.append(Flake(layer: layer, arriveAt: now + dur + 0.12, key: key, localX: lx,
+                                    area: 0.6 * .pi * r * r))
+            }
+        }
+    }
+
+    // MARK: piles
+
+    static let windowCorner: CGFloat = 12
+    static let dockCorner: CGFloat = 16
+
+    /// Snow on one surface as a closed path (global coords): tapers to nothing over the last
+    /// stretch and wraps over the rounded corner.
+    func pilePath(_ surf: Surface, _ pile: Pile) -> CGPath? {
+        let width = surf.width
+        guard width > 30 else { return nil }
+        let R = surf.z < 0 ? Engine.dockCorner : Engine.windowCorner
+        let T = max(R + 4, 16 * S)                    // taper length
+        func drop(_ d: CGFloat) -> CGFloat { d >= R ? 0 : R - (R * R - (R - d) * (R - d)).squareRoot() }
+        func smooth(_ t: CGFloat) -> CGFloat { let u = max(0, min(1, t)); return u * u * (3 - 2 * u) }
+        var tops: [CGPoint] = [], bots: [CGPoint] = []
+        var x: CGFloat = 0
+        while true {
+            let cx = min(x, width)
+            let d = min(cx, width - cx)
+            let h = pile.height(at: cx) * smooth(d / T) * (0.35 + 0.65 * smooth(d / (R * 0.8)))
+            let base = surf.top - drop(d)
+            tops.append(CGPoint(x: surf.minX + cx, y: base + h))
+            bots.append(CGPoint(x: surf.minX + cx, y: base - min(1.5, h)))
+            if cx >= width { break }
+            // finer steps on the corners so the curve stays round
+            x += d < T ? 1.5 : Pile.step
+        }
+        let p = CGMutablePath()
+        p.move(to: bots[0]); p.addLine(to: tops[0])
+        for i in 1..<tops.count {
+            let a = tops[i - 1], b = tops[i]
+            p.addQuadCurve(to: CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2), control: a)
+        }
+        p.addLine(to: tops[tops.count - 1])
+        for b in bots.reversed() { p.addLine(to: b) }
+        p.closeSubpath()
+        return p
+    }
+
+    /// Clip region for a surface's snow: its band minus the rounded shapes of windows in front.
+    /// Only recomputed when window geometry changes (boolean path ops are the expensive part).
+    func clipPath(_ surf: Surface) -> CGPath? {
+        guard surf.z > 0 else { return nil }
+        let R = Engine.windowCorner
+        let band = CGRect(x: surf.minX - 12, y: surf.top - R - 8, width: surf.width + 24, height: Pile.maxH + R + 24)
+        var occ: CGPath?
+        for w in wins where w.z < surf.z && w.frame.intersects(band) {
+            let rr = CGPath(roundedRect: w.frame, cornerWidth: R, cornerHeight: R, transform: nil)
+            occ = occ.map { $0.union(rr) } ?? rr
+        }
+        guard let o = occ else { return nil }
+        return CGPath(rect: band, transform: nil).subtracting(o)
+    }
+
+    /// Windows in front whose shape cuts this surface's snow, relative to the surface origin.
+    func occluderSignature(_ surf: Surface) -> [CGRect] {
+        guard surf.z > 0 else { return [] }
+        let band = CGRect(x: surf.minX - 12, y: surf.top - Engine.windowCorner - 8, width: surf.width + 24, height: Pile.maxH + Engine.windowCorner + 24)
+        return wins.filter { $0.z < surf.z && $0.frame.intersects(band) }.map { $0.frame.offsetBy(dx: -surf.minX, dy: -surf.top) }
+    }
+
+    /// Snow layers live in surface-local coordinates, so moving a window only moves a layer.
+    /// Paths are rebuilt only when that pile's heights or width change; masks only when the
+    /// windows in front of it change relative to it.
+    func redrawPiles() {
+        for (k, view) in pileViews where surfaces[k] == nil || piles[k] == nil {
+            view.container.removeFromSuperlayer(); pileViews[k] = nil
+        }
+        for (k, surf) in surfaces {
+            guard let pile = piles[k], pile.heights.count > 1 else { continue }
+            let empty = pile.mean <= 0.05 || (segments[k] ?? []).isEmpty
+            if empty { if let v = pileViews[k] { v.container.isHidden = true }; continue }
+            let view = pileViews[k] ?? PileView()
+            pileViews[k] = view
+            let o = overlays[overlayIndex(for: CGPoint(x: surf.minX + surf.width / 2, y: surf.top))]
+            if view.container.superlayer !== o.piles { o.piles.addSublayer(view.container) }
+            view.container.isHidden = false
+            view.container.zPosition = CGFloat(-surf.z)       // front windows' snow above back windows'
+            view.container.position = o.local(CGPoint(x: surf.minX, y: surf.top))
+            let toLocal = CGAffineTransform(translationX: -surf.minX, y: -surf.top)
+            let widthChanged = view.width != surf.width
+            if geometryChanged || widthChanged {
+                let sig = occluderSignature(surf)
+                if widthChanged || sig != view.occSig || view.width < 0 {
+                    view.occSig = sig
+                    if !sig.isEmpty, let c = clipPath(surf) {
+                        let band = c.boundingBoxOfPath
+                        view.mask.frame = band.applying(toLocal)
+                        view.mask.path = c.copy(using: [CGAffineTransform(translationX: -band.minX, y: -band.minY)])
+                        view.container.mask = view.mask
+                    } else { view.container.mask = nil }
+                }
+            }
+            if pile.dirty || widthChanged || view.needsPath {
+                pile.dirty = false; view.needsPath = false; view.width = surf.width
+                guard let gp = pilePath(surf, pile) else { continue }
+                view.top.path = gp.copy(using: [toLocal])
+                let under = gp.copy(using: [toLocal.translatedBy(x: 0, y: -1.2 * S)])
+                view.under.path = under
+                view.under.shadowPath = under
+            }
+        }
+    }
+
+    // MARK: props (snowmen & snowballs)
+
+    func addProp(_ m: Prop, on key: UInt64, atX gx: CGFloat, fromY: CGFloat) {
+        guard let s = surfaces[key] else { return }
+        if props.count >= 40 { props.removeFirst().remove() }
+        m.host = key
+        m.localX = min(max(gx, s.minX + m.halfWidth), s.maxX - m.halfWidth) - s.minX
+        m.pos = CGPoint(x: s.minX + m.localX, y: max(fromY, s.top))
+        props.append(m)
+        place(m)
+        updateRate()
+    }
+
+    func spawnSnowman(onSurface key: UInt64, atX gx: CGFloat, fromY: CGFloat) {
+        guard Settings.shared.snowmenOn else { return }
+        addProp(Prop(kind: .snowman, scale: S, withBalls: true), on: key, atX: gx, fromY: fromY)
+    }
+
+    func groundY(_ m: Prop, _ k: UInt64, _ s: Surface) -> CGFloat {
+        s.top + (piles[k]?.height(at: m.localX) ?? 0) * (m.kind == .snowman ? 0.45 : 0.5) - 1
+    }
+
+    func updateProps(dt: CGFloat) {
+        guard !props.isEmpty else { return }
+        let gravity: CGFloat = 1400 * S
+        let lowest = (overlays.map { $0.screen.frame.minY }.min() ?? 0) - 120
+        props.removeAll { m in
+            if let k = m.host, let s = surfaces[k] {
+                m.pos.x = s.minX + m.localX
+                let ground = groundY(m, k, s)
+                if m.grounded {
+                    m.pos.y = ground
+                } else {
+                    m.vy -= gravity * dt
+                    m.pos.y += m.vy * dt
+                    if m.vy <= 0 && m.pos.y <= ground { m.pos.y = ground; m.vy = 0; m.grounded = true }
+                }
+            } else {
+                // the window it sat on is gone: fall straight down off screen
+                m.host = nil; m.grounded = false
+                m.vy -= gravity * dt
+                m.pos.y += m.vy * dt
+                if m.pos.y < lowest { m.remove(); return true }
+            }
+            place(m)
+            return false
+        }
+    }
+
+    func overlayIndex(for p: CGPoint) -> Int {
+        if let i = overlays.firstIndex(where: { $0.screen.frame.insetBy(dx: 0, dy: -60).contains(p) }) { return i }
+        return overlays.enumerated().min { abs($0.element.screen.frame.midX - p.x) < abs($1.element.screen.frame.midX - p.x) }?.offset ?? 0
+    }
+
+    func place(_ m: Prop) {
+        guard !overlays.isEmpty else { return }
+        let o = overlays[overlayIndex(for: m.pos)]
+        if m.parent !== o.actors {
+            if let d = m.deco { o.actors.addSublayer(d) }
+            o.actors.addSublayer(m.layer); m.parent = o.actors
+        }
+        let lp = o.local(m.pos)
+        m.layer.position = m.kind == .snowman ? lp : CGPoint(x: lp.x, y: lp.y + m.scale)
+        if let d = m.deco {
+            var by = lp.y
+            if let k = m.host, let s = surfaces[k] { by = s.top - 1 - o.screen.frame.minY + (piles[k]?.height(at: m.localX) ?? 0) * 0.4 }
+            d.position = CGPoint(x: lp.x + (m.decoSide > 0 ? 14 * S : -40 * S), y: by)
+        }
+        var hidden = false
+        if let k = m.host, let s = surfaces[k], s.z > 0 {
+            let probe = CGPoint(x: m.pos.x, y: m.pos.y + min(16 * S, m.height / 2))
+            hidden = wins.contains { $0.z < s.z && $0.frame.contains(probe) }
+        }
+        m.layer.isHidden = hidden
+        m.deco?.isHidden = hidden || m.host == nil
+    }
+
+    func prop(at p: CGPoint) -> Prop? {
+        props.last { !$0.layer.isHidden && CGRect(x: $0.pos.x - $0.halfWidth, y: $0.pos.y - 2, width: 2 * $0.halfWidth, height: $0.height + 4).contains(p) }
+    }
+
+    func jump(_ m: Prop) {
+        guard m.host != nil, m.grounded else { return }
+        m.grounded = false
+        m.vy = 330 * S.squareRoot()
+        let k = m.kind == .snowman ? m.scale : m.scale / 20
+        let squash = CAKeyframeAnimation(keyPath: "transform.scale.y")
+        squash.values = [k, k * 0.82, k * 1.08, k]; squash.keyTimes = [0, 0.15, 0.5, 1]; squash.duration = 0.5
+        m.layer.add(squash, forKey: "squash")
+    }
+
+    // MARK: snowball rolling
+
+    /// mouse down: arm a roll if the press is on a visible pile band of a still window.
+    func rollBegin(at p: CGPoint) {
+        roll = nil
+        guard Settings.shared.snowmenOn else { return }
+        let cands = surfaces.values.filter { s in
+            guard p.x >= s.minX + 4, p.x <= s.maxX - 4, isVisible(s.key, p.x) else { return false }
+            let h = piles[s.key]?.height(at: p.x - s.minX) ?? 0
+            return h > 2 && p.y >= s.top - 8 && p.y <= s.top + h + 10 * S
+        }
+        guard let s = cands.min(by: { ($0.z < 0 ? -1 : $0.z) < ($1.z < 0 ? -1 : $1.z) }) else { return }
+        roll = Roll(key: s.key, surface: s, localX: p.x - s.minX)
+    }
+
+    func rollMove(to p: CGPoint) {
+        guard let r = roll else { return }
+        guard let s = surfaces[r.key], abs(s.minX - r.startMinX) < 0.5, abs(s.top - r.startTop) < 0.5 else {
+            rollCancel(); return                                       // the window moved: that's a window drag
+        }
+        let nx = min(max(p.x - s.minX, r.r), s.width - r.r)
+        let dx = nx - r.localX
+        if !r.shown {
+            guard abs(dx) >= 3 else { return }
+            r.shown = true
+            overlays[overlayIndex(for: p)].actors.addSublayer(r.layer)
+        }
+        if let pile = piles[r.key], dx != 0 {
+            let got = pile.take(from: r.localX, to: nx, fraction: 0.55)
+            r.r = min(Engine.maxBall, (r.r * r.r + got * 0.55 / .pi).squareRoot())
+            pileDirty = true; geometryChanged = true
+        }
+        r.angle -= dx / r.r
+        r.localX = nx
+    }
+
+    func updateRoll() {
+        guard let r = roll, r.shown, let s = surfaces[r.key] else { return }
+        let gx = s.minX + r.localX
+        let gy = s.top + (piles[r.key]?.height(at: r.localX) ?? 0) * 0.5 - 1 + r.r
+        let o = overlays[overlayIndex(for: CGPoint(x: gx, y: gy))]
+        if r.layer.superlayer !== o.actors { o.actors.addSublayer(r.layer) }
+        r.layer.position = o.local(CGPoint(x: gx, y: gy))
+        r.layer.setAffineTransform(CGAffineTransform(rotationAngle: r.angle).scaledBy(x: r.r / 20, y: r.r / 20))
+    }
+
+    func rollCancel() {
+        guard let r = roll else { return }
+        roll = nil
+        r.layer.removeFromSuperlayer()
+        // leave a decent ball where it was rather than making it vanish
+        if r.shown, r.r > 5 * S, surfaces[r.key] != nil {
+            addProp(Prop(kind: .ball, scale: r.r), on: r.key, atX: r.startMinX + r.localX, fromY: r.startTop + r.r)
+        }
+    }
+
+    /// mouse up: big ball -> snowman (with a pop), small ball -> snowball left on the edge.
+    @discardableResult
+    func rollEnd() -> Bool {
+        guard let r = roll else { return false }
+        roll = nil
+        guard r.shown else { return false }
+        r.layer.removeFromSuperlayer()
+        guard let s = surfaces[r.key] else { return true }
+        let gx = s.minX + r.localX
+        if r.r >= Engine.snowmanThreshold {
+            let m = Prop(kind: .snowman, scale: r.r / 9)
+            m.grounded = true
+            addProp(m, on: r.key, atX: gx, fromY: s.top)
+            let k = m.scale
+            let pop = CAKeyframeAnimation(keyPath: "transform.scale")
+            pop.values = [k * 0.3, k * 1.18, k * 0.94, k]; pop.keyTimes = [0, 0.45, 0.75, 1]; pop.duration = 0.4
+            m.layer.add(pop, forKey: "pop")
+        } else {
+            let b = Prop(kind: .ball, scale: r.r)
+            b.grounded = true
+            addProp(b, on: r.key, atX: gx, fromY: s.top)
+        }
+        return true
+    }
+
+    // MARK: plow
+
+    func startPlow() {
+        for (i, o) in overlays.enumerated() {
+            guard plows.allSatisfy({ $0.screenIndex != i }), let s = surfaces[Engine.dockKey(i)] else { continue }
+            let p = Plow(screenIndex: i, x: s.minX - 60 * S)
+            o.actors.addSublayer(p.mound)
+            o.actors.addSublayer(p.layer)
+            plows.append(p)
+        }
+        lastPlow = CACurrentMediaTime()
+        updateRate()
+    }
+
+    func updatePlows(dt: CGFloat, now: CFTimeInterval) {
+        if Settings.shared.autoPlow, plows.isEmpty, now - lastPlow > 90 {
+            let full = overlays.indices.contains { (piles[Engine.dockKey($0)]?.mean ?? 0) > Pile.maxH * 0.4 }
+            if full { startPlow() } else { lastPlow = now - 60 }
+        }
+        guard !plows.isEmpty else { return }
+        plows.removeAll { p in
+            guard p.screenIndex < overlays.count, let s = surfaces[Engine.dockKey(p.screenIndex)] else {
+                p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true
+            }
+            p.x += 90 * S.squareRoot() * dt
+            // scrape everything the blade passed over into the mound in front of it
+            let f = p.front
+            if f > p.lastFront, let pile = piles[s.key] {
+                p.volume += pile.take(from: p.lastFront - s.minX, to: f - s.minX, fraction: 1)
+                p.volume = min(p.volume, 1.6 * p.bladeH * p.bladeH)   // the rest spills off the front
+                pileDirty = true
+            }
+            p.lastFront = f
+            let o = overlays[p.screenIndex]
+            let base = o.local(CGPoint(x: f, y: s.top - 2))
+            p.layer.position = o.local(CGPoint(x: p.x, y: s.top - 1))
+            // wedge: tallest at the blade, sloping down ahead (area ≈ 0.6·H·L)
+            let path = CGMutablePath()
+            if p.volume > 4 {
+                var H = (p.volume / 1.32).squareRoot()
+                H = min(H, p.bladeH * 1.05)
+                let L = max(10, p.volume / (0.6 * H))
+                path.move(to: CGPoint(x: base.x - 2, y: base.y))
+                path.addLine(to: CGPoint(x: base.x - 2, y: base.y + H))
+                path.addQuadCurve(to: CGPoint(x: base.x + H * 0.25, y: base.y + H * 0.98), control: CGPoint(x: base.x + H * 0.1, y: base.y + H * 1.05))
+                path.addCurve(to: CGPoint(x: base.x + L, y: base.y), control1: CGPoint(x: base.x + L * 0.45, y: base.y + H * 0.95), control2: CGPoint(x: base.x + L * 0.7, y: base.y + H * 0.2))
+                path.closeSubpath()
+            }
+            p.mound.path = path
+            p.mound.shadowPath = path
+            if p.x - p.layer.bounds.width / 2 > s.maxX + 20 && f > o.screen.frame.maxX + p.volume / 10 {
+                p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true
+            }
+            if p.x > o.screen.frame.maxX + 200 * S { p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true }
+            return false
+        }
+    }
+
+    // MARK: mouse (global monitors; the overlay itself stays click-through)
+
+    var downPoint: CGPoint?
+    var downTime: CFTimeInterval = 0
+    var downWin: Win?
+
+    func topWindow(at p: CGPoint, in list: [Win]) -> Win? { list.first { $0.frame.contains(p) }.flatMap { $0.surface ? $0 : nil } }
+
+    func installMouseMonitors() {
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
+            guard let self else { return }
+            let p = NSEvent.mouseLocation
+            self.mouseIsDown = true
+            self.updateRate()
+            self.refreshGeometry()
+            self.downPoint = p
+            self.downTime = CACurrentMediaTime()
+            self.downWin = self.topWindow(at: p, in: self.wins)
+            self.rollBegin(at: p)
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] _ in
+            guard let self, self.roll != nil else { return }
+            self.refreshGeometry()
+            self.rollMove(to: NSEvent.mouseLocation)
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
+            guard let self else { return }
+            self.mouseIsDown = false
+            defer { self.updateRate() }
+            let rolled = self.rollEnd()
+            guard !rolled, let d = self.downPoint else { self.downPoint = nil; return }
+            self.downPoint = nil
+            let p = NSEvent.mouseLocation
+            guard hypot(p.x - d.x, p.y - d.y) < 4, CACurrentMediaTime() - self.downTime < 0.6 else { return }
+            if let m = self.prop(at: p) { self.jump(m); return }
+            guard Settings.shared.snowmenOn, let w0 = self.downWin else { return }
+            self.refreshGeometry()
+            guard let w1 = self.topWindow(at: p, in: self.wins), w1.id == w0.id, w1.frame == w0.frame else { return }
+            guard p.y >= w1.frame.maxY - 28 else { return }        // title-bar strip only
+            self.spawnSnowman(onSurface: UInt64(w1.id), atX: p.x, fromY: w1.frame.maxY + 26 * S)
+        }
+    }
+
+    // MARK: debug / demo hooks
+
+    func demoTargets() -> [Win] {
+        refreshGeometry()
+        let menuBottom = NSScreen.screens.map { $0.visibleFrame.maxY }.max() ?? .greatestFiniteMagnitude
+        return wins.filter { $0.surface && $0.frame.width > 300 && $0.frame.maxY < menuBottom - 60 }
+    }
+
+    func spawnDemoSnowmen() {
+        for w in demoTargets().prefix(2) {
+            let xs: [CGFloat] = w.z == 0 ? [0.25, 0.42] : [0.6]
+            for f in xs where isVisible(UInt64(w.id), w.frame.minX + w.frame.width * f) {
+                spawnSnowman(onSurface: UInt64(w.id), atX: w.frame.minX + w.frame.width * f, fromY: w.frame.maxY + 40 * S)
+            }
+        }
+    }
+    func jumpAll() { props.forEach(jump) }
+
+    /// debug: write surfaces / piles / windows to $TMPDIR/macsnow-debug.txt
+    func dump() {
+        var out = "interval=\(interval) flakes=\(flakes.count) props=\(props.count) paused=\(paused)\n"
+        for w in wins { out += "win id=\(w.id) z=\(w.z) surface=\(w.surface) frame=\(w.frame)\n" }
+        for s in orderedSurfaces {
+            let v = pileViews[s.key]
+            out += "surf key=\(s.key) z=\(s.z) x=\(Int(s.minX))..\(Int(s.maxX)) top=\(Int(s.top)) mean=\(String(format: "%.2f", piles[s.key]?.mean ?? -1)) segs=\(segments[s.key]?.map { "\(Int($0.0))-\(Int($0.1))" } ?? []) view=\(v != nil) hidden=\(v?.container.isHidden ?? true) masked=\(v?.container.mask != nil)\n"
+        }
+        try? out.write(toFile: NSTemporaryDirectory() + "macsnow-debug.txt", atomically: true, encoding: .utf8)
+    }
+    func fillAll() { piles.values.forEach { $0.fill() }; pileDirty = true; geometryChanged = true }
+
+    /// Scripted roll on the frontmost demo window: same code path as a real mouse drag.
+    func demoRoll() {
+        guard let w = demoTargets().first else { return }
+        let s = surfaces[UInt64(w.id)]!
+        piles[s.key]?.fill()
+        let startX = s.minX + s.width * 0.55
+        rollBegin(at: CGPoint(x: startX, y: s.top + 4))
+        guard roll != nil else { NSLog("MacSnow demoRoll: no pile band"); return }
+        var t: CGFloat = 0
+        Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] tm in
+            guard let self else { tm.invalidate(); return }
+            t += 1.0 / 60
+            let x = startX + sin(t * 2.2) * s.width * 0.18 + t * 25 * S
+            self.rollMove(to: CGPoint(x: x, y: s.top + 4))
+            if t > 4.5 || self.roll == nil { tm.invalidate(); self.rollEnd() }
+        }
+    }
+}
+
+// MARK: - App / menu bar
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    let engine = Engine()
+    var item: NSStatusItem!
+    let menu = NSMenu()
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let b = item.button {
+            if let img = NSImage(systemSymbolName: "snowflake", accessibilityDescription: "MacSnow") {
+                img.isTemplate = true; b.image = img
+            } else { b.title = "❄" }
+        }
+        menu.delegate = self
+        item.menu = menu
+        engine.start()
+        if ProcessInfo.processInfo.arguments.contains("--demo") {
+            engine.demoBoost = 10
+            DispatchQueue.main.asyncAfter(deadline: .now() + 25) { self.engine.demoBoost = 1 }
+        }
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        let s = Settings.shared
+        menu.removeAllItems()
+        func add(_ title: String, _ sel: Selector, on: Bool? = nil, key: String = "") {
+            let i = NSMenuItem(title: title, action: sel, keyEquivalent: key)
+            i.target = self
+            if let on { i.state = on ? .on : .off }
+            menu.addItem(i)
+        }
+        add("눈 내리기 (Snow)", #selector(toggleSnow), on: s.snowOn)
+        let sub = NSMenu()
+        for it in Intensity.allCases {
+            let i = NSMenuItem(title: it.title, action: #selector(setIntensity(_:)), keyEquivalent: "")
+            i.target = self; i.tag = it.rawValue; i.state = it == s.intensity ? .on : .off
+            sub.addItem(i)
+        }
+        let parent = NSMenuItem(title: "세기 (Intensity)", action: nil, keyEquivalent: "")
+        parent.submenu = sub
+        menu.addItem(parent)
+        add("눈사람 (Snowmen) — 제목줄 클릭 / 눈 굴리기", #selector(toggleSnowmen), on: s.snowmenOn)
+        add("제설차 자동 (Auto plow)", #selector(toggleAutoPlow), on: s.autoPlow)
+        menu.addItem(.separator())
+        add("지금 Dock 제설 (Plow the Dock now)", #selector(plowNow))
+        add("앞 창에 눈사람 놓기 (Debug)", #selector(debugSpawn))
+        add("눈 치우기 (Clear snow)", #selector(clearSnow))
+        menu.addItem(.separator())
+        add("종료 (Quit)", #selector(quit), key: "q")
+    }
+
+    @objc func toggleSnow() { Settings.shared.snowOn.toggle(); engine.updateRate() }
+    @objc func toggleSnowmen() { Settings.shared.snowmenOn.toggle(); engine.applySettings() }
+    @objc func toggleAutoPlow() { Settings.shared.autoPlow.toggle() }
+    @objc func setIntensity(_ i: NSMenuItem) { Settings.shared.intensity = Intensity(rawValue: i.tag) ?? .normal }
+    @objc func plowNow() { engine.startPlow() }
+    @objc func debugSpawn() { engine.spawnDemoSnowmen() }
+    @objc func clearSnow() { engine.clearSnow() }
+    @objc func quit() { NSApp.terminate(nil) }
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+// Debug control channel (see notify.sh): plow, spawn, jump, clear, fill, roll
+for (name, action) in [("plow", { delegate.engine.startPlow() }),
+                       ("spawn", { delegate.engine.spawnDemoSnowmen() }),
+                       ("jump", { delegate.engine.jumpAll() }),
+                       ("clear", { delegate.engine.clearSnow() }),
+                       ("fill", { delegate.engine.fillAll() }),
+                       ("roll", { delegate.engine.demoRoll() }),
+                       ("dump", { delegate.engine.dump() }),
+                       ("fast", {
+                           delegate.engine.refreshGeometry()
+                           delegate.engine.downWin = delegate.engine.wins.first { $0.surface }
+                           delegate.engine.forceFast = true; delegate.engine.updateRate()
+                           DispatchQueue.main.asyncAfter(deadline: .now() + 12) { delegate.engine.forceFast = false; delegate.engine.updateRate() }
+                       })] as [(String, () -> Void)] {
+    DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow." + name), object: nil, queue: .main) { _ in action() }
+}
+app.run()
