@@ -29,7 +29,7 @@ enum Showcase {
 
     static func run(outDir: String) {
         // fixed settings for the run only (argument domain: never written to disk)
-        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false],
+        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false],
                                                 forName: UserDefaults.argumentDomain)
         S = 1.15
         let fm = FileManager.default
@@ -134,6 +134,7 @@ enum Showcase {
         let ns = NSGraphicsContext(cgContext: ctx, flipped: false)
         NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = ns
         drawWallpaper(ctx)
+        e.overlays[0].backRoot.render(in: ctx)          // falling flakes: behind the windows and the Dock
         for w in fake.list.reversed() where w.visible { drawWindow(ctx, w) }
         drawDock(ctx)
         // plow beacon blink (the real app does this with a CA animation)
