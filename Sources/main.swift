@@ -569,6 +569,7 @@ struct Spill {
     let area: CGFloat
     let source: UInt64
     let fromDock: Bool
+    var ttl: CGFloat = .infinity       // finite: a fading poof particle
 }
 
 /// A snowman or a snowball sitting on a surface.
@@ -632,6 +633,26 @@ final class Roll {
     }
 }
 
+/// A loose ball picked up by hand; retain the pickup attachment until the gesture ends.
+final class Carry {
+    let prop: Prop
+    let host: UInt64
+    let localX: CGFloat
+    let pickup: CGPoint
+    let down: CGPoint
+    let offset: CGSize
+    var lastPoint: CGPoint
+    var lastTime: CFTimeInterval
+    var active = false
+    var cancelled = false
+    init(prop: Prop, host: UInt64, at p: CGPoint, time: CFTimeInterval) {
+        self.prop = prop; self.host = host; localX = prop.localX; pickup = prop.pos
+        down = p; offset = CGSize(width: prop.pos.x - p.x, height: prop.pos.y - p.y)
+        lastPoint = p; lastTime = time
+    }
+    func position(at p: CGPoint) -> CGPoint { CGPoint(x: p.x + offset.width, y: p.y + offset.height) }
+}
+
 // MARK: - Engine
 
 /// Selector target for CADisplayLink (Engine isn't an NSObject).
@@ -654,6 +675,7 @@ final class Engine {
     var props: [Prop] = []
     var plows: [Plow] = []
     var roll: Roll?
+    var carry: Carry?
     var timer: Timer?
     var interval: Double = 0
     var paused = false
@@ -733,6 +755,7 @@ final class Engine {
             ps.append(SavedPile(key: k, width: Double(w), heights: p.heights.map { Float(($0 * 10).rounded() / 10) }))
         }
         let pr = props.compactMap { m -> SavedProp? in
+            if let c = carry, c.prop === m { return nil }
             guard let h = m.host, m.grounded else { return nil }
             return SavedProp(snowman: m.kind == .snowman, scale: Double(m.scale), host: h, localX: Double(m.localX), balls: m.deco != nil)
         }
@@ -900,7 +923,10 @@ final class Engine {
     }
 
     func clearSnow() { piles.removeAll(); dropAllFlakes(); pileDirty = true; geometryChanged = true; removeAllProps() }
-    func removeAllProps() { props.forEach { $0.remove() }; props.removeAll() }
+    func removeAllProps() {
+        carry?.active = false; carry?.cancelled = true
+        props.forEach { $0.remove() }; props.removeAll()
+    }
 
     static func dockKey(_ i: Int) -> UInt64 { (1 << 40) + UInt64(i) }
 
@@ -1148,6 +1174,32 @@ final class Engine {
         return l
     }
 
+    /// A falling snowman/ball hits the Dock: burst into a short puff and leave a small bump of snow.
+    func poof(_ m: Prop, on s: Surface) {
+        m.remove()
+        guard !overlays.isEmpty else { return }
+        let area = m.kind == .snowman ? 0.3 * (13 * m.scale) * (50 * m.scale) : .pi * m.scale * m.scale
+        piles[s.key]?.deposit(at: m.pos.x - s.minX, area: area)
+        pileDirty = true
+        let count = m.kind == .snowman ? 26 : 12
+        let w = m.halfWidth, h = m.height * 0.7
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for _ in 0..<count {
+            let pos = CGPoint(x: m.pos.x + .random(in: -w...w), y: s.top + .random(in: 0...h))
+            let o = overlays[overlayIndex(for: pos)]
+            let layer = flakeLayer()
+            let r = CGFloat.random(in: 1.2...2.6) * S
+            layer.bounds = CGRect(x: 0, y: 0, width: 2 * r, height: 2 * r)
+            layer.cornerRadius = r; layer.position = o.local(pos)
+            o.actors.addSublayer(layer)
+            let dir: CGFloat = pos.x < m.pos.x ? -1 : 1
+            spills.append(Spill(layer: layer, pos: pos, vy: .random(in: 60...260) * S, vx: dir * .random(in: 30...170) * S,
+                                area: 0, source: s.key, fromDock: true, ttl: .random(in: 0.4...0.6)))
+        }
+        CATransaction.commit()
+        updateRate()
+    }
+
     func spillSnow(_ samples: [(x: CGFloat, y: CGFloat, area: CGFloat)], from surf: Surface) {
         guard !overlays.isEmpty else { return }
         let total = samples.reduce(CGFloat(0)) { $0 + $1.area }
@@ -1191,8 +1243,13 @@ final class Engine {
                 piles[s.key]?.deposit(at: f.pos.x - s.minX, area: f.area)
                 pileDirty = true; landed = true
             }
-            if landed || f.pos.y < bottom {
-                f.layer.removeFromSuperlayer(); flakePool.append(f.layer)
+            if f.ttl.isFinite {
+                f.ttl -= dt
+                f.vx *= 1 - min(1, 3 * dt)                   // air drag: a puff, not shrapnel
+                f.layer.opacity = Float(max(0, min(1, f.ttl / 0.25)))
+            }
+            if landed || f.pos.y < bottom || f.ttl <= 0 {
+                f.layer.removeFromSuperlayer(); f.layer.opacity = 1; flakePool.append(f.layer)
             } else {
                 let o = overlays[overlayIndex(for: f.pos)]
                 if f.layer.superlayer !== o.actors { o.actors.addSublayer(f.layer) }
@@ -1311,7 +1368,7 @@ final class Engine {
 
     func addProp(_ m: Prop, on key: UInt64, atX gx: CGFloat, fromY: CGFloat) {
         guard let s = surfaces[key] else { return }
-        if props.count >= 40 { props.removeFirst().remove() }
+        if props.count >= 40, let i = props.firstIndex(where: { $0 !== carry?.prop }) { props.remove(at: i).remove() }
         m.host = key
         m.localX = min(max(gx, s.minX + m.halfWidth), s.maxX - m.halfWidth) - s.minX
         m.pos = CGPoint(x: s.minX + m.localX, y: max(fromY, s.top))
@@ -1330,10 +1387,13 @@ final class Engine {
     }
 
     func updateProps(dt: CGFloat) {
+        if let c = carry, !c.cancelled,
+           drag?.confirmed == true || (!c.active && surfaces[c.host] == nil) { carryCancel() }
         guard !props.isEmpty else { return }
         let gravity: CGFloat = 1400 * S
         let lowest = (overlays.map { $0.frame.minY }.min() ?? 0) - 120
         props.removeAll { m in
+            if let c = carry, c.active, c.prop === m { place(m); return false }
             if let k = m.host, let s = surfaces[k] {
                 m.pos.x = s.minX + m.localX
                 let ground = groundY(m, k, s)
@@ -1349,10 +1409,15 @@ final class Engine {
                 m.layer.isHidden = true; m.deco?.isHidden = true
                 return false
             } else {
-                // the window it sat on is gone: fall straight down off screen
+                // the window it sat on is gone: fall straight down; poof on the Dock, else off screen
                 m.host = nil; m.grounded = false
+                let oldY = m.pos.y
                 m.vy -= gravity * dt
                 m.pos.y += m.vy * dt
+                if let d = orderedSurfaces.first(where: { $0.z < 0 && m.pos.x >= $0.minX && m.pos.x <= $0.maxX }) {
+                    let g = d.top + (piles[d.key]?.height(at: m.pos.x - d.minX) ?? 0) * 0.5
+                    if oldY >= g && m.pos.y <= g { m.pos.y = g; poof(m, on: d); return true }
+                }
                 if m.pos.y < lowest { m.remove(); return true }
             }
             place(m)
@@ -1400,8 +1465,13 @@ final class Engine {
         m.deco?.isHidden = hidden || m.host == nil
     }
 
-    func prop(at p: CGPoint) -> Prop? {
-        props.last { !$0.layer.isHidden && CGRect(x: $0.pos.x - $0.halfWidth, y: $0.pos.y - 2, width: 2 * $0.halfWidth, height: $0.height + 4).contains(p) }
+    func prop(at p: CGPoint, ballsOnly: Bool = false) -> Prop? {
+        props.last {
+            if ballsOnly && ($0.kind != .ball || !$0.grounded) { return false }
+            let pad: CGFloat = ballsOnly ? 4 : 0
+            return !$0.layer.isHidden && CGRect(x: $0.pos.x - $0.halfWidth - pad, y: $0.pos.y - 2 - pad,
+                                                width: 2 * ($0.halfWidth + pad), height: $0.height + 4 + 2 * pad).contains(p)
+        }
     }
 
     func jump(_ m: Prop) {
@@ -1412,6 +1482,85 @@ final class Engine {
         let squash = CAKeyframeAnimation(keyPath: "transform.scale.y")
         squash.values = [k, k * 0.82, k * 1.08, k]; squash.keyTimes = [0, 0.15, 0.5, 1]; squash.duration = 0.5
         m.layer.add(squash, forKey: "squash")
+    }
+
+    // MARK: snowball carrying
+
+    func carryCancel() {
+        guard let c = carry, !c.cancelled else { return }
+        c.cancelled = true; c.active = false
+        let m = c.prop
+        m.host = c.host; m.localX = c.localX; m.pos = c.pickup; m.grounded = true; m.vy = 0
+        if let s = surfaces[c.host] { m.pos = CGPoint(x: s.minX + c.localX, y: groundY(m, c.host, s)) }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        place(m)
+        CATransaction.commit()
+    }
+
+    func carryMove(to p: CGPoint) {
+        guard let c = carry, !c.cancelled else { return }
+        if drag?.confirmed == true || (!c.active && surfaces[c.host] == nil) { carryCancel(); return }
+        let now = clock(), elapsed = now - c.lastTime
+        let dx = p.x - c.lastPoint.x, dy = p.y - c.lastPoint.y
+        c.lastPoint = p; c.lastTime = now
+        if !c.active {
+            guard hypot(p.x - c.down.x, p.y - c.down.y) > 4 else { return }
+            c.active = true
+            c.prop.host = nil; c.prop.grounded = false; c.prop.vy = 0
+            c.prop.layer.removeAnimation(forKey: "squash")
+        }
+        var prediction = CGSize.zero
+        if elapsed > 0 && elapsed < 0.15 {
+            let factor = min(CGFloat(0.016 / elapsed), 24 / max(0.001, hypot(dx, dy)))
+            prediction = CGSize(width: dx * factor, height: dy * factor)
+        }
+        let pos = c.position(at: p)
+        c.prop.pos = CGPoint(x: pos.x + prediction.width, y: pos.y + prediction.height)
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        place(c.prop)
+        CATransaction.commit()
+    }
+
+    func pop(_ m: Prop) {
+        let k = m.scale
+        let pop = CAKeyframeAnimation(keyPath: "transform.scale")
+        pop.values = [k * 0.3, k * 1.18, k * 0.94, k]; pop.keyTimes = [0, 0.45, 0.75, 1]; pop.duration = 0.4
+        m.layer.add(pop, forKey: "pop")
+    }
+
+    func carryEnd(at p: CGPoint) {
+        guard let c = carry, c.active, !c.cancelled else { return }
+        let m = c.prop
+        m.pos = c.position(at: p)       // release uses the actual grab point, without prediction
+        let center = CGPoint(x: m.pos.x, y: m.pos.y + m.scale)
+        let targets = props.reversed().filter { $0 !== m && !$0.layer.isHidden }
+        if Settings.shared.snowmenOn, let target = targets.first(where: { t in
+            t.kind == .ball && t.host.flatMap { surfaces[$0] } != nil &&
+                hypot(center.x - t.pos.x, center.y - (t.pos.y + t.scale)) < m.scale + t.scale + 6
+        }), let key = target.host {
+            let snowman = Prop(kind: .snowman, scale: max(m.scale, target.scale) / 9)
+            snowman.grounded = true
+            m.remove(); target.remove()
+            props.removeAll { $0 === m || $0 === target }
+            addProp(snowman, on: key, atX: target.pos.x, fromY: target.pos.y)
+            snowman.localX = target.localX; snowman.pos = target.pos
+            place(snowman); pop(snowman)
+            return
+        }
+        if let target = targets.first(where: { t in
+            guard t.kind == .snowman else { return false }
+            let x = min(max(center.x, t.pos.x - t.halfWidth), t.pos.x + t.halfWidth)
+            let y = min(max(center.y, t.pos.y), t.pos.y + t.height)
+            return hypot(center.x - x, center.y - y) < m.scale + 6
+        }) {
+            let side: CGFloat = center.x < target.pos.x ? -1 : 1
+            m.pos.x = target.pos.x + side * (target.halfWidth + m.scale + 6)
+        }
+        let surface = landingSurface(at: m.pos.x, below: m.pos.y, above: -CGFloat.greatestFiniteMagnitude)
+        m.host = surface?.key
+        m.localX = surface.map { m.pos.x - $0.minX } ?? 0
+        m.grounded = false; m.vy = 0
+        place(m)
     }
 
     // MARK: snowball rolling
@@ -1483,10 +1632,7 @@ final class Engine {
             let m = Prop(kind: .snowman, scale: r.r / 9)
             m.grounded = true
             addProp(m, on: r.key, atX: gx, fromY: s.top)
-            let k = m.scale
-            let pop = CAKeyframeAnimation(keyPath: "transform.scale")
-            pop.values = [k * 0.3, k * 1.18, k * 0.94, k]; pop.keyTimes = [0, 0.45, 0.75, 1]; pop.duration = 0.4
-            m.layer.add(pop, forKey: "pop")
+            pop(m)
         } else {
             let b = Prop(kind: .ball, scale: r.r)
             b.grounded = true
@@ -1568,10 +1714,11 @@ final class Engine {
     }
 
     func mouseDown(at p: CGPoint) {
+        carryCancel(); carry = nil
         mouseIsDown = true
         refreshGeometry()
         downPoint = p
-        downTime = CACurrentMediaTime()
+        downTime = clock()
         downWin = topWindow(at: p, in: wins)
         drag = nil
         // title bar / toolbar strip: a possible window drag
@@ -1579,12 +1726,19 @@ final class Engine {
             drag = Drag(id: w.id, frame0: w.frame, p0: p, p: p)
         }
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        rollBegin(at: p)
+        if let m = prop(at: p, ballsOnly: true), let key = m.host, surfaces[key] != nil {
+            rollCancel()
+            carry = Carry(prop: m, host: key, at: p, time: clock())
+        } else { rollBegin(at: p) }
         CATransaction.commit()
         updateRate()
     }
 
     func mouseDragged(to p: CGPoint) {
+        if carry != nil { refreshGeometry() }
+        // Run after the window check, including its early returns: the same press reaches
+        // the window behind our click-through overlay and may confirm a title-bar drag.
+        defer { carryMove(to: p) }
         if roll != nil {
             CATransaction.begin(); CATransaction.setDisableActions(true)
             refreshGeometry()
@@ -1599,11 +1753,12 @@ final class Engine {
             guard let f = windowSource.frame(of: d.id) else { drag = nil; return }
             if f.size != d.frame0.size { drag = nil; return }
             if f.origin == d.frame0.origin {
-                drag = hypot(p.x - d.p0.x, p.y - d.p0.y) > 12 ? nil : d
+                drag = carry == nil && hypot(p.x - d.p0.x, p.y - d.p0.y) > 12 ? nil : d
                 return
             }
             d.confirmed = true
             if roll != nil { rollCancel() }
+            carryCancel()
         }
         drag = d
         moveDragged(to: d.predicted(p))
@@ -1613,6 +1768,7 @@ final class Engine {
         mouseIsDown = false
         defer { updateRate() }
         if drag?.confirmed == true {
+            carryCancel()
             drag = nil
             // final word from the window list (it may have snapped / tiled)
             CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -1628,10 +1784,19 @@ final class Engine {
         drag = nil
         CATransaction.begin(); CATransaction.setDisableActions(true)
         defer { CATransaction.commit() }
+        if let c = carry {
+            defer { carry = nil; downPoint = nil }
+            refreshGeometry()
+            if !c.active && surfaces[c.host] == nil { carryCancel() }
+            guard !c.cancelled else { return }
+            if c.active { carryEnd(at: p) }
+            else if hypot(p.x - c.down.x, p.y - c.down.y) <= 4, clock() - downTime < 0.6 { jump(c.prop) }
+            return
+        }
         let rolled = rollEnd()
         guard !rolled, let d = downPoint else { downPoint = nil; return }
         downPoint = nil
-        guard hypot(p.x - d.x, p.y - d.y) < 4, CACurrentMediaTime() - downTime < 0.6 else { return }
+        guard hypot(p.x - d.x, p.y - d.y) < 4, clock() - downTime < 0.6 else { return }
         if let m = prop(at: p) { jump(m); return }
         guard Settings.shared.snowmenOn, let w0 = downWin else { return }
         refreshGeometry()
@@ -1656,6 +1821,16 @@ final class Engine {
             }
         }
     }
+    func spawnDemoBalls() {
+        guard let w = demoTargets().first, let s = surfaces[UInt64(w.id)] else { return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for (offset, radius) in [(CGFloat(-60), 7 * S), (CGFloat(60), 5 * S)] {
+            let x = (s.minX + s.maxX) / 2 + offset
+            guard isVisible(s.key, x) else { continue }
+            addProp(Prop(kind: .ball, scale: radius), on: s.key, atX: x, fromY: s.top + 40 * S)
+        }
+        CATransaction.commit()
+    }
     func jumpAll() { props.forEach(jump) }
 
     /// debug: write surfaces / piles / windows to $TMPDIR/macsnow-debug.txt
@@ -1666,7 +1841,7 @@ final class Engine {
         for (k, p) in piles.sorted(by: { $0.key < $1.key }) where p.mean > 0.05 {
             out += "pile key=\(k) mean=\(String(format: "%.2f", p.mean)) n=\(p.heights.count) inList=\(surfaces[k] != nil)\n"
         }
-        for m in props { out += "prop host=\(m.host.map(String.init) ?? "nil") hidden=\(m.layer.isHidden) grounded=\(m.grounded) x=\(Int(m.pos.x))\n" }
+        for m in props { out += "prop kind=\(m.kind == .ball ? "ball" : "snowman") host=\(m.host.map(String.init) ?? "nil") x=\(m.pos.x) y=\(m.pos.y) r=\(m.scale) grounded=\(m.grounded) hidden=\(m.layer.isHidden)\n" }
         for s in orderedSurfaces {
             let v = pileViews[s.key]
             out += "surf key=\(s.key) z=\(s.z) x=\(Int(s.minX))..\(Int(s.maxX)) top=\(Int(s.top)) mean=\(String(format: "%.2f", piles[s.key]?.mean ?? -1)) segs=\(segments[s.key]?.map { "\(Int($0.0))-\(Int($0.1))" } ?? []) view=\(v != nil) hidden=\(v?.container.isHidden ?? true) masked=\(v?.container.mask != nil)\n"
@@ -1784,9 +1959,10 @@ if let i = CommandLine.arguments.firstIndex(of: "--showcase") {
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
-// Debug control channel (see notify.sh): plow, spawn, jump, clear, fill, roll
+// Debug control channel (see notify.sh): plow, spawn, balls, jump, clear, fill, roll
 for (name, action) in [("plow", { delegate.engine.startPlow() }),
                        ("spawn", { delegate.engine.spawnDemoSnowmen() }),
+                       ("balls", { delegate.engine.spawnDemoBalls() }),
                        ("jump", { delegate.engine.jumpAll() }),
                        ("clear", { delegate.engine.clearSnow() }),
                        ("fill", { delegate.engine.fillAll() }),
