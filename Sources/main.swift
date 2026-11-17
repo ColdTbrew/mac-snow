@@ -3,7 +3,7 @@ import AppKit
 import QuartzCore
 
 /// Size scale so things read like the reel on large displays (1.0 on a ~900pt-tall screen).
-let S: CGFloat = {
+var S: CGFloat = {
     let h = NSScreen.screens.first?.frame.height ?? 900
     return max(1, min(1.8, h / 900))
 }()
@@ -37,6 +37,23 @@ struct Win {
     let frame: CGRect      // AppKit global coordinates (y up)
     let z: Int             // 0 = frontmost
     let surface: Bool      // normal window (layer 0): snow lands on it; floating ones only hide snow
+}
+
+/// Where window rectangles come from: the real window server, or a scripted fake (showcase).
+protocol WindowProvider {
+    func fetch() -> [Win]                 // front-to-back
+    func frame(of id: CGWindowID) -> CGRect?
+}
+
+struct SystemWindows: WindowProvider {
+    func fetch() -> [Win] { WindowList.fetch() }
+    func frame(of id: CGWindowID) -> CGRect? {
+        guard let raw = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]],
+              let b = raw.first?[kCGWindowBounds as String] as? [String: CGFloat] else { return nil }
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        let h = b["Height"] ?? 0
+        return CGRect(x: b["X"] ?? 0, y: primaryH - (b["Y"] ?? 0) - h, width: b["Width"] ?? 0, height: h)
+    }
 }
 
 enum WindowList {
@@ -323,16 +340,27 @@ func makePlowLayer(px: CGFloat) -> (CALayer, CGFloat) {
 // MARK: - Overlay per screen
 
 final class Overlay {
-    let screen: NSScreen
-    let window: NSWindow
+    let frame: CGRect          // global coordinates of the screen this overlay covers
+    let screen: NSScreen?
+    let window: NSWindow?
     let root: CALayer
     let piles = CALayer()
     let actors = CALayer()
     let flakeRoot = CALayer()
 
+    /// Offscreen overlay for the showcase renderer: same layers, no window.
+    init(virtualFrame: CGRect) {
+        frame = virtualFrame; screen = nil; window = nil
+        root = CALayer()
+        root.frame = CGRect(origin: .zero, size: virtualFrame.size)
+        for l in [piles, actors, flakeRoot] as [CALayer] { l.frame = root.bounds; root.addSublayer(l) }
+    }
+
     init(screen: NSScreen) {
         self.screen = screen
-        window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        frame = screen.frame
+        let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        self.window = window
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
@@ -350,7 +378,7 @@ final class Overlay {
         window.orderFrontRegardless()
     }
 
-    func local(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x - screen.frame.minX, y: p.y - screen.frame.minY) }
+    func local(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x - frame.minX, y: p.y - frame.minY) }
 }
 
 /// Layers for one surface's snow: a blue-grey underside + white top, clipped by a mask.
@@ -379,6 +407,8 @@ final class PileView {
 /// A falling flake: Core Animation moves it (no per-frame CPU work); we only settle it on arrival.
 struct Flake {
     let layer: CALayer
+    let startAt: CFTimeInterval
+    let fromY: CGFloat, toY: CGFloat       // overlay-local
     let arriveAt: CFTimeInterval
     let key: UInt64?          // surface it lands on (nil = falls off the bottom)
     let localX: CGFloat
@@ -466,6 +496,12 @@ final class Engine {
     var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
     var flakePool: [CALayer] = []
     var lastPileDraw: CFTimeInterval = 0
+    var windowSource: WindowProvider = SystemWindows()
+    /// Dock top edge for an overlay: estimated from Dock prefs, or scripted in the showcase.
+    var dockSource: (Overlay) -> (CGFloat, CGFloat, CGFloat)? = { o in o.screen.flatMap { DockGeometry.span(for: $0) } }
+    /// Showcase drives a virtual clock and moves flakes itself (render(in:) can't see CA animations).
+    var virtualNow: CFTimeInterval?
+    func clock() -> CFTimeInterval { virtualNow ?? CACurrentMediaTime() }
     var last = CACurrentMediaTime()
     var lastPlow = CACurrentMediaTime()
     var spawnDebt: CGFloat = 0
@@ -504,6 +540,7 @@ final class Engine {
     }
 
     func updateRate() {
+        if virtualNow != nil { return }        // showcase steps the engine itself
         let want = desiredInterval()
         if want == nil { timer?.invalidate(); timer = nil; interval = 0; return }
         if timer != nil && want! == interval { return }
@@ -569,7 +606,7 @@ final class Engine {
     }
 
     func rebuildOverlays() {
-        for o in overlays { o.window.orderOut(nil) }
+        for o in overlays { o.window?.orderOut(nil) }
         dropAllFlakes()
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
         pileViews.removeAll()
@@ -591,16 +628,11 @@ final class Engine {
     /// Full window list (~1 ms on a busy desktop). During a drag we only re-read the dragged
     /// window every frame (refreshDragged) and do the full list ~8 times a second.
     func refreshGeometry() {
-        applyWins(WindowList.fetch())
+        applyWins(windowSource.fetch())
     }
 
     func refreshDragged() {
-        guard let d = downWin,
-              let raw = CGWindowListCopyWindowInfo(.optionIncludingWindow, d.id) as? [[String: Any]],
-              let b = raw.first?[kCGWindowBounds as String] as? [String: CGFloat] else { refreshGeometry(); return }
-        let primaryH = NSScreen.screens.first?.frame.height ?? 0
-        let h = b["Height"] ?? 0
-        let f = CGRect(x: b["X"] ?? 0, y: primaryH - (b["Y"] ?? 0) - h, width: b["Width"] ?? 0, height: h)
+        guard let d = downWin, let f = windowSource.frame(of: d.id) else { refreshGeometry(); return }
         guard let i = wins.firstIndex(where: { $0.id == d.id }), wins[i].frame != f else { return }
         var list = wins
         list[i] = Win(id: d.id, frame: f, z: list[i].z, surface: list[i].surface)
@@ -614,7 +646,7 @@ final class Engine {
             s[UInt64(w.id)] = Surface(key: UInt64(w.id), minX: w.frame.minX, maxX: w.frame.maxX, top: w.frame.maxY, z: w.z)
         }
         for (i, o) in overlays.enumerated() {
-            if let (a, b, t) = DockGeometry.span(for: o.screen) {
+            if let (a, b, t) = dockSource(o) {
                 s[Engine.dockKey(i)] = Surface(key: Engine.dockKey(i), minX: a, maxX: b, top: t, z: -1)
             }
         }
@@ -660,7 +692,7 @@ final class Engine {
 
     func tick() {
         tickCount += 1
-        let now = CACurrentMediaTime()
+        let now = clock()
         let dt = CGFloat(min(0.25, now - last))
         last = now
 
@@ -696,7 +728,13 @@ final class Engine {
             kept.reserveCapacity(flakes.count)
             CATransaction.begin(); CATransaction.setDisableActions(true)
             for f in flakes {
-                if now < f.arriveAt { kept.append(f); continue }
+                if now < f.arriveAt {
+                    if virtualNow != nil {   // showcase: move it ourselves
+                        let k = min(1, (now - f.startAt) / max(0.001, f.arriveAt - 0.12 - f.startAt))
+                        f.layer.position.y = f.fromY + (f.toY - f.fromY) * CGFloat(k)
+                    }
+                    kept.append(f); continue
+                }
                 if let k = f.key, let pile = piles[k] {
                     pile.deposit(at: f.localX, area: f.area)
                     // --demo: extra flakes' worth of snow, spread nearby (keeps the profile smooth)
@@ -714,7 +752,7 @@ final class Engine {
         // keeps falling in front of it to the windows / Dock further down (windows are layered).
         let ordered = orderedSurfaces
         for o in overlays {
-            let f = o.screen.frame
+            let f = o.frame
             spawnDebt += rate * f.width / 100 * dt
             while spawnDebt >= 1 {
                 spawnDebt -= 1
@@ -746,12 +784,15 @@ final class Engine {
                 layer.position = CGPoint(x: x - f.minX, y: endY - f.minY)
                 o.flakeRoot.addSublayer(layer)
                 CATransaction.commit()
-                let a = CABasicAnimation(keyPath: "position.y")
-                a.fromValue = startY - f.minY
-                a.toValue = endY - f.minY
-                a.duration = dur
-                layer.add(a, forKey: "fall")
-                flakes.append(Flake(layer: layer, arriveAt: now + dur + 0.12, key: key, localX: lx,
+                if virtualNow == nil {
+                    let a = CABasicAnimation(keyPath: "position.y")
+                    a.fromValue = startY - f.minY
+                    a.toValue = endY - f.minY
+                    a.duration = dur
+                    layer.add(a, forKey: "fall")
+                } else { layer.position.y = startY - f.minY }
+                flakes.append(Flake(layer: layer, startAt: now, fromY: startY - f.minY, toY: endY - f.minY,
+                                    arriveAt: now + dur + 0.12, key: key, localX: lx,
                                     area: 0.6 * .pi * r * r))
             }
         }
@@ -886,7 +927,7 @@ final class Engine {
     func updateProps(dt: CGFloat) {
         guard !props.isEmpty else { return }
         let gravity: CGFloat = 1400 * S
-        let lowest = (overlays.map { $0.screen.frame.minY }.min() ?? 0) - 120
+        let lowest = (overlays.map { $0.frame.minY }.min() ?? 0) - 120
         props.removeAll { m in
             if let k = m.host, let s = surfaces[k] {
                 m.pos.x = s.minX + m.localX
@@ -911,8 +952,8 @@ final class Engine {
     }
 
     func overlayIndex(for p: CGPoint) -> Int {
-        if let i = overlays.firstIndex(where: { $0.screen.frame.insetBy(dx: 0, dy: -60).contains(p) }) { return i }
-        return overlays.enumerated().min { abs($0.element.screen.frame.midX - p.x) < abs($1.element.screen.frame.midX - p.x) }?.offset ?? 0
+        if let i = overlays.firstIndex(where: { $0.frame.insetBy(dx: 0, dy: -60).contains(p) }) { return i }
+        return overlays.enumerated().min { abs($0.element.frame.midX - p.x) < abs($1.element.frame.midX - p.x) }?.offset ?? 0
     }
 
     func place(_ m: Prop) {
@@ -926,7 +967,7 @@ final class Engine {
         m.layer.position = m.kind == .snowman ? lp : CGPoint(x: lp.x, y: lp.y + m.scale)
         if let d = m.deco {
             var by = lp.y
-            if let k = m.host, let s = surfaces[k] { by = s.top - 1 - o.screen.frame.minY + (piles[k]?.height(at: m.localX) ?? 0) * 0.4 }
+            if let k = m.host, let s = surfaces[k] { by = s.top - 1 - o.frame.minY + (piles[k]?.height(at: m.localX) ?? 0) * 0.4 }
             d.position = CGPoint(x: lp.x + (m.decoSide > 0 ? 14 * S : -40 * S), y: by)
         }
         var hidden = false
@@ -1043,7 +1084,7 @@ final class Engine {
             o.actors.addSublayer(p.layer)
             plows.append(p)
         }
-        lastPlow = CACurrentMediaTime()
+        lastPlow = clock()
         updateRate()
     }
 
@@ -1083,10 +1124,10 @@ final class Engine {
             }
             p.mound.path = path
             p.mound.shadowPath = path
-            if p.x - p.layer.bounds.width / 2 > s.maxX + 20 && f > o.screen.frame.maxX + p.volume / 10 {
+            if p.x - p.layer.bounds.width / 2 > s.maxX + 20 && f > o.frame.maxX + p.volume / 10 {
                 p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true
             }
-            if p.x > o.screen.frame.maxX + 200 * S { p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true }
+            if p.x > o.frame.maxX + 200 * S { p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true }
             return false
         }
     }
@@ -1246,6 +1287,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 
 let app = NSApplication.shared
+// `MacSnow --showcase <dir>`: render the scripted demo on a virtual desktop to PNG frames and exit.
+if let i = CommandLine.arguments.firstIndex(of: "--showcase") {
+    let dir = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : "showcase-out"
+    Showcase.run(outDir: dir)
+    exit(0)
+}
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
