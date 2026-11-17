@@ -111,7 +111,10 @@ enum Showcase {
         step(30 * 1, record: true)
         // 5) close "메모" -> its snowman falls off
         fake.list[notes].visible = false
-        step(30 * 2, record: true)
+        var poofShot = false
+        step(30 * 2, record: true) { _ in
+            if !poofShot, !engine.spills.isEmpty { poofShot = true; step(3, record: true); still("still-7-poof") }
+        }
         // 6) resize narrower: Finder's exposed right edge spills onto the Dock below.
         let fi = fake.index(1)
         let originalWidth = fake.list[fi].frame.width
@@ -142,6 +145,27 @@ enum Showcase {
         var shot = false
         step(30 * 7, record: true) { _ in
             if !shot, let p = engine.plows.first, p.x > dockRect.midX + 40 { still("still-4-plow"); shot = true }
+        }
+        // 9) pick up a loose ball and stack it on the larger one (real mouse handlers).
+        if let s = engine.surfaces[2] {
+            let base = Prop(kind: .ball, scale: 7 * S)
+            let small = Prop(kind: .ball, scale: 5 * S)
+            let x = s.minX + s.width * 0.35
+            engine.addProp(base, on: s.key, atX: x, fromY: s.top + 30)
+            engine.addProp(small, on: s.key, atX: x + 120, fromY: s.top + 30)
+            step(20, record: true)
+            let start = CGPoint(x: small.pos.x, y: small.pos.y + small.scale)
+            let end = CGPoint(x: base.pos.x, y: base.pos.y + base.scale)
+            engine.mouseDown(at: start)
+            step(30, record: true) { i in
+                let k = CGFloat(i + 1) / 30
+                engine.mouseDragged(to: CGPoint(x: start.x + (end.x - start.x) * k,
+                                                y: start.y + (end.y - start.y) * k + 65 * sin(.pi * k)))
+                if i == 14 { still("still-6-stack") }
+            }
+            engine.mouseUp(at: end)
+            step(15, record: true)
+            still("still-6-stacked")
         }
         print("showcase: \(frameNo) frames -> \(outDir)")
     }
