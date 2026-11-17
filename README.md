@@ -13,7 +13,7 @@
 
 - **눈 내리기**: 화면 전체에 하얀 눈송이가 천천히 똑바로 내려요. 모든 창 위에 그려지지만 클릭은 그대로 아래 창으로 통과해요.
 - **창·Dock 위에 쌓임**: 눈송이가 창 윗면이나 Dock 윗면에 닿으면 그 자리에 쌓여요. 창이 겹쳐 있으면 일부는 뒤쪽 창이나 Dock까지 떨어져요. 앞 창에 가려진 부분은 그 창의 둥근 모서리 모양대로 가려지고, 눈 더미 끝은 창 모서리를 따라 자연스럽게 얇아져요.
-- **창 드래그 따라가기**: 창을 끌고 다니면 쌓인 눈과 눈사람이 같이 따라오고, 옮긴 자리에서도 계속 쌓여요.
+- **창 드래그 따라가기**: 창을 끌고 다니면 쌓인 눈과 눈사람이 마우스 움직임에 맞춰 바로 따라오고, 옮긴 자리에서도 계속 쌓여요.
 - **눈 굴려 눈사람 만들기**: 창 위에 쌓인 눈을 마우스로 좌우로 문지르듯 드래그하면 눈덩이가 굴러가며 커지고, 지나간 자리의 눈은 줄어요. 충분히 크면 손을 놓는 순간 산타 모자 눈사람이 뿅 하고 생기고, 작으면 눈덩이로 남아요. (창 자체가 움직이면 창 드래그로 보고 굴리기를 취소해요.)
 - **제목줄 클릭 눈사람·점프**: 창 제목줄(위쪽 약 28pt)을 클릭하면 그 자리에 눈사람이 톡 떨어져 서요. 눈사람을 클릭하면 폴짝 뛰어요.
 - **창을 닫으면 떨어짐**: 눈사람이 서 있던 창이 닫히거나 사라지면 아래로 떨어져요.
@@ -138,6 +138,7 @@ open /Applications/MacSnow.app
   ffmpeg -framerate 15 -i showcase-out/frames/f%04d.png \
     -vf "scale=720:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=96:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle" docs/demo.gif
   ```
+- 드래그 지연 측정: `--laglog <파일>`로 앱을 띄우고 `build/testwin <파일>` 실행 후 `tools/notify.sh testwin.lagtest`를 보내면 테스트 창이 스스로 움직이며 같은 움직임을 가짜 마우스 신호로 앱에 보내요. `python3 tools/lagstats.py <testwin 로그> <앱 로그>`로 창과 눈 더미 위치 차이를 계산해요. `--legacydrag`는 예전 방식(창 목록 폴링)으로 비교할 때 써요.
 - `tools/testwin.swift`: 테스트용 창. `swiftc tools/testwin.swift -o build/testwin && build/testwin` 후 `tools/notify.sh testwin.move`로 창을 움직여 볼 수 있어요.
 
 ## 라이선스

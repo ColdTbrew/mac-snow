@@ -56,6 +56,16 @@ struct SystemWindows: WindowProvider {
     }
 }
 
+/// Debug (lag test): the real list, except windows whose frame a simulated drag reported.
+/// Lets the drag-lag test run even when the window server's list is unreliable (e.g. screen locked).
+final class SimOverride: WindowProvider {
+    var frames: [CGWindowID: CGRect] = [:]
+    func fetch() -> [Win] {
+        WindowList.fetch().map { w in frames[w.id].map { Win(id: w.id, frame: $0, z: w.z, surface: w.surface) } ?? w }
+    }
+    func frame(of id: CGWindowID) -> CGRect? { frames[id] ?? SystemWindows().frame(of: id) }
+}
+
 enum WindowList {
     static func fetch() -> [Win] {
         guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
@@ -478,6 +488,13 @@ final class Roll {
 
 // MARK: - Engine
 
+/// Selector target for CADisplayLink (Engine isn't an NSObject).
+final class LinkTarget: NSObject {
+    let f: () -> Void
+    init(_ f: @escaping () -> Void) { self.f = f }
+    @objc func fire() { f() }
+}
+
 final class Engine {
     var overlays: [Overlay] = []
     var piles: [UInt64: Pile] = [:]
@@ -511,6 +528,39 @@ final class Engine {
     var demoBoost: CGFloat = 1
     var mouseIsDown = false
     var forceFast = false        // debug: behave as if the mouse were held (to measure drag cost)
+    var displayLink: AnyObject?  // CADisplayLink (macOS 14+) while the mouse is down
+
+    /// A window being dragged by its title bar. Its snow follows the mouse directly
+    /// (frame at mouse-down + mouse delta) instead of waiting for the window list to catch up.
+    struct Drag {
+        let id: CGWindowID
+        let frame0: CGRect
+        let p0: CGPoint
+        var p: CGPoint
+        var confirmed = false            // the window list showed the window really moving
+        var bias = CGSize.zero           // persistent offset learned from the window list (e.g. menu bar clamp)
+        var pendingDiff: CGSize?
+        var pendingAt: CGPoint?          // mouse position when pendingDiff was seen
+        func predicted(_ q: CGPoint) -> CGRect {
+            var f = frame0.offsetBy(dx: q.x - p0.x + bias.width, dy: q.y - p0.y + bias.height)
+            // windows can't go above the menu bar
+            if let sc = NSScreen.screens.first(where: { $0.frame.contains(q) }), f.maxY > sc.visibleFrame.maxY {
+                f.origin.y = sc.visibleFrame.maxY - f.height
+            }
+            return f
+        }
+    }
+    var drag: Drag?
+    var predictDrag = !ProcessInfo.processInfo.arguments.contains("--legacydrag")   // debug: old behaviour
+    /// debug (--laglog <file>): when the dragged window's frame changes in `wins`, log time + origin
+    var lagLog: FileHandle? = {
+        let a = ProcessInfo.processInfo.arguments
+        guard let i = a.firstIndex(of: "--laglog"), i + 1 < a.count else { return nil }
+        FileManager.default.createFile(atPath: a[i + 1], contents: nil)
+        return FileHandle(forWritingAtPath: a[i + 1])
+    }()
+    var lagLast: CGPoint?
+    func lagWrite(_ line: String) { lagLog?.write((line + "\n").data(using: .utf8)!) }
 
     static let snowmanThreshold: CGFloat = 9 * S     // ball radius that turns into a snowman
     static let maxBall: CGFloat = 16 * S
@@ -542,7 +592,21 @@ final class Engine {
     func updateRate() {
         if virtualNow != nil { return }        // showcase steps the engine itself
         let want = desiredInterval()
-        if want == nil { timer?.invalidate(); timer = nil; interval = 0; return }
+        if want == nil { timer?.invalidate(); timer = nil; stopLink(); interval = 0; return }
+        // mouse down: tick in step with the display (no timer phase drift / tolerance slop)
+        if predictDrag, want! <= 1.0 / 60 + 1e-6, #available(macOS 14, *), let sc = NSScreen.main ?? NSScreen.screens.first {
+            if displayLink == nil {
+                timer?.invalidate(); timer = nil
+                let l = sc.displayLink(target: LinkTarget { [weak self] in self?.tick() }, selector: #selector(LinkTarget.fire))
+                l.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+                l.add(to: .main, forMode: .common)
+                displayLink = l
+                last = CACurrentMediaTime()
+            }
+            interval = want!
+            return
+        }
+        stopLink()
         if timer != nil && want! == interval { return }
         interval = want!
         timer?.invalidate()
@@ -551,6 +615,13 @@ final class Engine {
         RunLoop.main.add(t, forMode: .common)
         timer = t
         last = CACurrentMediaTime()
+    }
+
+    func stopLink() {
+        guard let l = displayLink else { return }
+        if #available(macOS 14, *) { (l as? CADisplayLink)?.invalidate() }
+        displayLink = nil
+        if timer == nil { interval = 0 }    // force updateRate to start a timer
     }
 
     /// Stop all work while displays sleep, the screen is locked or the session is switched out.
@@ -628,7 +699,48 @@ final class Engine {
     /// Full window list (~1 ms on a busy desktop). During a drag we only re-read the dragged
     /// window every frame (refreshDragged) and do the full list ~8 times a second.
     func refreshGeometry() {
-        applyWins(windowSource.fetch())
+        var list = windowSource.fetch()
+        // while a title-bar drag is followed by prediction, the list's (older) frame mustn't pull it back
+        if let d = drag, d.confirmed, let i = list.firstIndex(where: { $0.id == d.id }),
+           let cur = wins.first(where: { $0.id == d.id }) {
+            list[i] = Win(id: d.id, frame: cur.frame, z: list[i].z, surface: list[i].surface)
+        }
+        applyWins(list)
+    }
+
+    /// Put the dragged window at `f` and move its snow + snowmen right now (no implicit animation).
+    func moveDragged(to f: CGRect) {
+        guard let d = drag, let i = wins.firstIndex(where: { $0.id == d.id }), wins[i].frame != f else { return }
+        var list = wins
+        list[i] = Win(id: d.id, frame: f, z: list[i].z, surface: list[i].surface)
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        applyWins(list)
+        redrawPiles(paths: false)
+        geometryChanged = false               // positions + masks are done; the tick needn't redo them
+        updateProps(dt: 0)
+        updateRoll()
+        CATransaction.commit()
+    }
+
+    /// Compare the prediction with the window list. A difference > 2 pt that stays the same while the
+    /// mouse holds still is a real offset (snapping, clamping): adopt it. While moving, the list may
+    /// simply be behind, so never chase it then.
+    func reconcileDrag() {
+        guard var d = drag, d.confirmed, let f = windowSource.frame(of: d.id) else { return }
+        let pr = d.predicted(d.p)
+        let diff = CGSize(width: f.minX - pr.minX, height: f.minY - pr.minY)
+        if lagLog != nil { lagWrite(String(format: "R %.6f %.2f %.2f", CACurrentMediaTime(), diff.width, diff.height)) }
+        if f.size != d.frame0.size { drag = nil; refreshGeometry(); return }     // it's being resized, not moved
+        if hypot(diff.width, diff.height) > 2 {
+            if let pd = d.pendingDiff, d.pendingAt == d.p, hypot(diff.width - pd.width, diff.height - pd.height) < 1 {
+                d.bias.width += diff.width; d.bias.height += diff.height; d.pendingDiff = nil
+                drag = d
+                moveDragged(to: d.predicted(d.p))
+                return
+            }
+            d.pendingDiff = diff; d.pendingAt = d.p
+        } else { d.pendingDiff = nil }
+        drag = d
     }
 
     func refreshDragged() {
@@ -641,6 +753,10 @@ final class Engine {
 
     func applyWins(_ list: [Win]) {
         wins = list
+        if lagLog != nil, let id = downWin?.id, let w = list.first(where: { $0.id == id }), w.frame.origin != lagLast {
+            lagLast = w.frame.origin
+            lagWrite(String(format: "A %.6f %.2f %.2f %@", CACurrentMediaTime(), w.frame.minX, w.frame.minY, drag?.confirmed == true ? "pred" : "list"))
+        }
         var s: [UInt64: Surface] = [:]
         for w in wins where w.surface {
             s[UInt64(w.id)] = Surface(key: UInt64(w.id), minX: w.frame.minX, maxX: w.frame.maxX, top: w.frame.maxY, z: w.z)
@@ -698,7 +814,10 @@ final class Engine {
 
         // window bounds: mouse down -> the window under the cursor every frame (60 Hz) + full list
         // ~8 Hz; otherwise the full list ~4 Hz whatever the tick rate
-        if mouseIsDown || forceFast {
+        if let d = drag, d.confirmed {
+            if tickCount % 4 == 0 { reconcileDrag() }          // ~15 Hz check against the window list
+            if tickCount % 8 == 0 { refreshGeometry() }
+        } else if mouseIsDown || forceFast {
             if tickCount % 8 == 0 { refreshGeometry() } else { refreshDragged() }
         } else if tickCount % max(1, Int(0.25 / max(interval, 0.001))) == 0 { refreshGeometry() }
         CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -862,7 +981,7 @@ final class Engine {
     /// Snow layers live in surface-local coordinates, so moving a window only moves a layer.
     /// Paths are rebuilt only when that pile's heights or width change; masks only when the
     /// windows in front of it change relative to it.
-    func redrawPiles() {
+    func redrawPiles(paths: Bool = true) {
         for (k, view) in pileViews where surfaces[k] == nil || piles[k] == nil {
             view.container.removeFromSuperlayer(); pileViews[k] = nil
         }
@@ -891,7 +1010,7 @@ final class Engine {
                     } else { view.container.mask = nil }
                 }
             }
-            if pile.dirty || widthChanged || view.needsPath {
+            if paths && (pile.dirty || view.needsPath) || widthChanged {
                 pile.dirty = false; view.needsPath = false; view.width = surf.width
                 guard let gp = pilePath(surf, pile) else { continue }
                 view.top.path = gp.copy(using: [toLocal])
@@ -1141,38 +1260,82 @@ final class Engine {
     func topWindow(at p: CGPoint, in list: [Win]) -> Win? { list.first { $0.frame.contains(p) }.flatMap { $0.surface ? $0 : nil } }
 
     func installMouseMonitors() {
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in
-            guard let self else { return }
-            let p = NSEvent.mouseLocation
-            self.mouseIsDown = true
-            self.updateRate()
-            self.refreshGeometry()
-            self.downPoint = p
-            self.downTime = CACurrentMediaTime()
-            self.downWin = self.topWindow(at: p, in: self.wins)
-            self.rollBegin(at: p)
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in self?.mouseDown(at: NSEvent.mouseLocation) }
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] _ in self?.mouseDragged(to: NSEvent.mouseLocation) }
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in self?.mouseUp(at: NSEvent.mouseLocation) }
+    }
+
+    func mouseDown(at p: CGPoint) {
+        mouseIsDown = true
+        refreshGeometry()
+        downPoint = p
+        downTime = CACurrentMediaTime()
+        downWin = topWindow(at: p, in: wins)
+        drag = nil
+        // title bar / toolbar strip: a possible window drag
+        if predictDrag, let w = downWin, p.y >= w.frame.maxY - 60 {
+            drag = Drag(id: w.id, frame0: w.frame, p0: p, p: p)
         }
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] _ in
-            guard let self, self.roll != nil else { return }
-            self.refreshGeometry()
-            self.rollMove(to: NSEvent.mouseLocation)
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        rollBegin(at: p)
+        CATransaction.commit()
+        updateRate()
+    }
+
+    func mouseDragged(to p: CGPoint) {
+        if roll != nil {
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            refreshGeometry()
+            rollMove(to: p)
+            CATransaction.commit()
         }
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
-            guard let self else { return }
-            self.mouseIsDown = false
-            defer { self.updateRate() }
-            let rolled = self.rollEnd()
-            guard !rolled, let d = self.downPoint else { self.downPoint = nil; return }
-            self.downPoint = nil
-            let p = NSEvent.mouseLocation
-            guard hypot(p.x - d.x, p.y - d.y) < 4, CACurrentMediaTime() - self.downTime < 0.6 else { return }
-            if let m = self.prop(at: p) { self.jump(m); return }
-            guard Settings.shared.snowmenOn, let w0 = self.downWin else { return }
-            self.refreshGeometry()
-            guard let w1 = self.topWindow(at: p, in: self.wins), w1.id == w0.id, w1.frame == w0.frame else { return }
-            guard p.y >= w1.frame.maxY - 28 else { return }        // title-bar strip only
-            self.spawnSnowman(onSurface: UInt64(w1.id), atX: p.x, fromY: w1.frame.maxY + 26 * S)
+        guard var d = drag else { return }
+        d.p = p
+        if !d.confirmed {
+            // first make sure the window really follows the mouse (some title areas don't drag,
+            // the top edge resizes): one cheap single-window query per event until it moves
+            guard let f = windowSource.frame(of: d.id) else { drag = nil; return }
+            if f.size != d.frame0.size { drag = nil; return }
+            if f.origin == d.frame0.origin {
+                drag = hypot(p.x - d.p0.x, p.y - d.p0.y) > 12 ? nil : d
+                return
+            }
+            d.confirmed = true
+            if roll != nil { rollCancel() }
         }
+        drag = d
+        moveDragged(to: d.predicted(p))
+    }
+
+    func mouseUp(at p: CGPoint) {
+        mouseIsDown = false
+        defer { updateRate() }
+        if drag?.confirmed == true {
+            drag = nil
+            // final word from the window list (it may have snapped / tiled)
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            refreshGeometry(); redrawPiles(paths: false); updateProps(dt: 0)
+            CATransaction.commit()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self, !self.mouseIsDown else { return }
+                CATransaction.begin(); CATransaction.setDisableActions(true)
+                self.refreshGeometry(); self.redrawPiles(paths: false); self.updateProps(dt: 0)
+                CATransaction.commit()
+            }
+        }
+        drag = nil
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        let rolled = rollEnd()
+        guard !rolled, let d = downPoint else { downPoint = nil; return }
+        downPoint = nil
+        guard hypot(p.x - d.x, p.y - d.y) < 4, CACurrentMediaTime() - downTime < 0.6 else { return }
+        if let m = prop(at: p) { jump(m); return }
+        guard Settings.shared.snowmenOn, let w0 = downWin else { return }
+        refreshGeometry()
+        guard let w1 = topWindow(at: p, in: wins), w1.id == w0.id, w1.frame == w0.frame else { return }
+        guard p.y >= w1.frame.maxY - 28 else { return }        // title-bar strip only
+        spawnSnowman(onSurface: UInt64(w1.id), atX: p.x, fromY: w1.frame.maxY + 26 * S)
     }
 
     // MARK: debug / demo hooks
@@ -1310,6 +1473,22 @@ for (name, action) in [("plow", { delegate.engine.startPlow() }),
                            delegate.engine.forceFast = true; delegate.engine.updateRate()
                            DispatchQueue.main.asyncAfter(deadline: .now() + 12) { delegate.engine.forceFast = false; delegate.engine.updateRate() }
                        })] as [(String, () -> Void)] {
-    DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow." + name), object: nil, queue: .main) { _ in action() }
+    DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow." + name), object: nil, queue: .main) { _ in
+        CATransaction.begin(); CATransaction.setDisableActions(true); action(); CATransaction.commit()
+    }
+}
+// Simulated mouse for drag-lag measurement (tools/testwin.swift lagtest):
+// object = "x,y,windowID,fx,fy,fw,fh" (mouse point + the test window's real frame, AppKit global)
+let sim = SimOverride()
+for (name, act) in [("sim.down", { (p: CGPoint) in delegate.engine.mouseDown(at: p) }),
+                    ("sim.drag", { (p: CGPoint) in delegate.engine.mouseDragged(to: p) }),
+                    ("sim.up", { (p: CGPoint) in delegate.engine.mouseUp(at: p) })] as [(String, (CGPoint) -> Void)] {
+    DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow." + name), object: nil, queue: .main) { n in
+        let c = ((n.object as? String) ?? "").split(separator: ",").compactMap { Double($0) }
+        guard c.count == 7 else { return }
+        if !(delegate.engine.windowSource is SimOverride) { delegate.engine.windowSource = sim }
+        sim.frames[CGWindowID(c[2])] = CGRect(x: c[3], y: c[4], width: c[5], height: c[6])
+        act(CGPoint(x: c[0], y: c[1]))
+    }
 }
 app.run()
