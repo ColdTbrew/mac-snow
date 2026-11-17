@@ -120,11 +120,13 @@ enum Showcase {
         if let dock = engine.surfaces[Engine.dockKey(0)], let pile = engine.piles[dock.key] {
             _ = pile.take(from: 500 - dock.minX, to: 690 - dock.minX, fraction: 0.65)
         }
+        engine.mouseIsDown = true          // a mouse resize (non-mouse size changes keep the snow)
         step(30, record: true) { i in
             fake.list[fi].frame.size.width = originalWidth - 250 * CGFloat(i + 1) / 30
             engine.refreshGeometry()
             if i == 18 { still("still-5-spill") }
         }
+        engine.mouseIsDown = false
         step(30, record: true)       // clumps reach the Dock
         // 7) Dock width change: remove two icons, keeping the Dock centered.
         let oldDock = dockRect
