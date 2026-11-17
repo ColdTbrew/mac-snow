@@ -9,7 +9,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" build/obj
 # Apple Silicon + Intel 유니버설 바이너리
 for ARCH in arm64 x86_64; do
   swiftc -O -swift-version 5 -target "$ARCH-apple-macos$MIN" \
-    -framework AppKit -framework QuartzCore \
+    -framework AppKit -framework QuartzCore -framework ApplicationServices \
     Sources/*.swift -o "build/obj/MacSnow-$ARCH"
 done
 lipo -create build/obj/MacSnow-arm64 build/obj/MacSnow-x86_64 -output "$APP/Contents/MacOS/MacSnow"

@@ -25,13 +25,14 @@ final class FakeWindows: WindowProvider {
 enum Showcase {
     static let size = CGSize(width: 1440, height: 900)
     static let menuH: CGFloat = 24
-    static let dockRect = CGRect(x: 455, y: 6, width: 530, height: 64)
+    static var dockRect = CGRect(x: 455, y: 6, width: 530, height: 64)
 
     static func run(outDir: String) {
         // fixed settings for the run only (argument domain: never written to disk)
         UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false],
                                                 forName: UserDefaults.argumentDomain)
         S = 1.15
+        dockRect = CGRect(x: 455, y: 6, width: 530, height: 64)
         let fm = FileManager.default
         try? fm.createDirectory(atPath: outDir + "/frames", withIntermediateDirectories: true)
 
@@ -111,11 +112,33 @@ enum Showcase {
         // 5) close "메모" -> its snowman falls off
         fake.list[notes].visible = false
         step(30 * 2, record: true)
-        // 6) snowplow pushes the Dock snow into a mound
+        // 6) resize narrower: Finder's exposed right edge spills onto the Dock below.
+        let fi = fake.index(1)
+        let originalWidth = fake.list[fi].frame.width
+        engine.piles[1]?.fill()
+        // Leave room in the receiving pile so the landed clumps visibly add snow.
+        if let dock = engine.surfaces[Engine.dockKey(0)], let pile = engine.piles[dock.key] {
+            _ = pile.take(from: 500 - dock.minX, to: 690 - dock.minX, fraction: 0.65)
+        }
+        step(30, record: true) { i in
+            fake.list[fi].frame.size.width = originalWidth - 250 * CGFloat(i + 1) / 30
+            engine.refreshGeometry()
+            if i == 18 { still("still-5-spill") }
+        }
+        step(30, record: true)       // clumps reach the Dock
+        // 7) Dock width change: remove two icons, keeping the Dock centered.
+        let oldDock = dockRect
+        step(18, record: true) { i in
+            let inset = 60 * CGFloat(i + 1) / 18
+            dockRect = oldDock.insetBy(dx: inset, dy: 0)
+            engine.refreshGeometry()
+        }
+        step(12, record: true)
+        // 8) snowplow pushes the Dock snow into a mound
         engine.piles[Engine.dockKey(0)]?.fill()
         engine.startPlow()
         var shot = false
-        step(30 * 10, record: true) { _ in
+        step(30 * 7, record: true) { _ in
             if !shot, let p = engine.plows.first, p.x > dockRect.midX + 40 { still("still-4-plow"); shot = true }
         }
         print("showcase: \(frameNo) frames -> \(outDir)")
@@ -234,15 +257,17 @@ enum Showcase {
         c.setFillColor(rgb(1, 1, 1, 0.28)); c.fillPath()
         c.addPath(CGPath(roundedRect: d, cornerWidth: 18, cornerHeight: 18, transform: nil))
         c.setStrokeColor(rgb(1, 1, 1, 0.45)); c.setLineWidth(1); c.strokePath()
-        let cols = [rgb(0.30, 0.60, 0.98), rgb(0.98, 0.35, 0.40), rgb(1.0, 0.80, 0.25), rgb(0.35, 0.80, 0.45),
+        var cols = [rgb(0.30, 0.60, 0.98), rgb(0.98, 0.35, 0.40), rgb(1.0, 0.80, 0.25), rgb(0.35, 0.80, 0.45),
                     rgb(0.60, 0.45, 0.95), rgb(0.98, 0.55, 0.25), rgb(0.25, 0.75, 0.85), rgb(0.85, 0.85, 0.88)]
+        if d.width < 470 { cols.removeSubrange(5...6) }
+        let last = cols.count - 1
         for (i, col) in cols.enumerated() {
-            let x = d.minX + 14 + CGFloat(i) * 60 + (i >= 7 ? 22 : 0)
+            let x = d.minX + 14 + CGFloat(i) * 60 + (i == last ? 22 : 0)
             let r = CGRect(x: x, y: d.minY + 8, width: 48, height: 48)
             c.addPath(CGPath(roundedRect: r, cornerWidth: 11, cornerHeight: 11, transform: nil)); c.setFillColor(col); c.fillPath()
             c.setFillColor(rgb(1, 1, 1, 0.85)); c.fillEllipse(in: r.insetBy(dx: 15, dy: 15))
         }
-        c.setFillColor(rgb(1, 1, 1, 0.5)); c.fill(CGRect(x: d.minX + 14 + 7 * 60 + 2, y: d.minY + 12, width: 1, height: 40))
+        c.setFillColor(rgb(1, 1, 1, 0.5)); c.fill(CGRect(x: d.minX + 14 + CGFloat(last) * 60 + 2, y: d.minY + 12, width: 1, height: 40))
     }
 
     static func drawMenuBar(_ c: CGContext) {
