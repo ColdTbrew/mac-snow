@@ -9,6 +9,19 @@
 - Xcode 없이 Command Line Tools만으로 빌드
 - Dock 아이콘 없이 메뉴바 ❄ 아이콘으로만 동작
 
+## 다운로드
+
+**[최신 버전 받기 (DMG / ZIP)](https://github.com/ColdTbrew/mac-snow/releases/latest)**
+
+1. `MacSnow-<버전>.dmg`를 받아 열고, MacSnow를 Applications 폴더로 끌어다 놓아요.
+2. 개발자 서명·공증이 없는 앱이라 처음 열 때 막힐 수 있어요. 그러면 한 번 열기를 시도한 뒤 **시스템 설정 > 개인정보 보호 및 보안**에서 **그래도 열기**를 누르거나, 터미널에서 아래를 실행해요.
+   ```
+   xattr -dr com.apple.quarantine /Applications/MacSnow.app
+   ```
+3. 메뉴바에 ❄가 생기면 끝이에요. (macOS 13 이상, Apple Silicon·Intel)
+
+직접 빌드하려면 아래 [설치·실행](#설치실행)을 봐 주세요.
+
 ## 기능
 
 - **눈 내리기**: 화면 전체에 하얀 눈송이가 천천히 똑바로 내려요. 내리는 눈송이는 앱 창 뒤(바탕화면 위)로 지나가서 창 내용을 가리지 않아요. 창 윗면이나 Dock에 닿은 눈은 앞쪽에 쌓여 보여요. 클릭은 전부 그대로 통과해요.
@@ -135,6 +148,7 @@ open /Applications/MacSnow.app
 
 - 앱 코드는 `Sources/main.swift`, 가상 화면 렌더러는 `Sources/Showcase.swift`예요.
 - `open build/MacSnow.app --args --demo`로 실행하면 처음 25초 동안 눈이 빨리 쌓여요(확인용).
+- 배포 파일 만들기: `./tools/release.sh 0.1.0` → `dist/MacSnow-0.1.0.dmg`, `.zip`, `SHA256SUMS.txt` (애드혹 서명). `v*` 태그를 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 맥에서 빌드해 릴리스에 올려요.
 - `tools/notify.sh`: 실행 중인 앱에 디버그 신호를 보내요.
   `plow`(제설차), `spawn`(눈사람), `jump`, `clear`, `fill`(눈 가득), `roll`(눈 굴리기 시연), `dump`(상태를 `$TMPDIR/macsnow-debug.txt`에 기록), `fast`(12초간 드래그 중인 것처럼 60Hz)
 - 스크린샷·데모 다시 만들기: 실제 화면은 캡처하지 않고 가상 화면에 시나리오(눈 쌓임 → 창 드래그 → 눈 굴리기 → 눈사람 점프 → 창 닫기 → 창 좁히기·눈 낙하 → Dock 폭 변경 → 제설차)를 돌려 PNG로 저장해요.

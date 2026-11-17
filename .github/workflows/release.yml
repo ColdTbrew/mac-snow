@@ -1,0 +1,36 @@
+name: release
+# v* 태그를 푸시하면 맥에서 빌드해 DMG/ZIP을 그 릴리스에 올려요(이미 올라가 있으면 건너뜀).
+# 수동 실행(workflow_dispatch)은 빌드만 해서 워크플로 아티팩트로 남겨요.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 빌드·패키징
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then VER="${GITHUB_REF_NAME#v}"; else VER="0.0.0-ci"; fi
+          ./tools/release.sh "$VER" "${{ github.run_number }}"
+          lipo -archs build/MacSnow.app/Contents/MacOS/MacSnow
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MacSnow
+          path: dist/*
+      - name: 릴리스에 올리기
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "MacSnow ${TAG#v}" --notes "자동 빌드 (애드혹 서명, 공증 안 됨). 설치 방법은 README를 봐 주세요."
+          fi
+          if gh release view "$TAG" --json assets -q '.assets[].name' | grep -q '\.dmg$'; then
+            echo "이미 DMG가 있어서 올리지 않아요"; exit 0
+          fi
+          gh release upload "$TAG" dist/*.dmg dist/*.zip dist/SHA256SUMS.txt
