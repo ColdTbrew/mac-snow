@@ -1,5 +1,7 @@
 # MacSnow ❄
 
+![MacSnow 데모](docs/demo.gif)
+
 맥 화면에 눈이 내리고, 창 윗면과 Dock 위에 눈이 소복이 쌓이는 메뉴바 앱이에요.
 인스타그램 릴스에서 본 크리스마스 데스크톱 효과를 보고 처음부터 새로 만들었어요(원본 영상의 이미지·에셋은 쓰지 않았어요).
 
@@ -16,6 +18,16 @@
 - **제목줄 클릭 눈사람·점프**: 창 제목줄(위쪽 약 28pt)을 클릭하면 그 자리에 눈사람이 톡 떨어져 서요. 눈사람을 클릭하면 폴짝 뛰어요.
 - **창을 닫으면 떨어짐**: 눈사람이 서 있던 창이 닫히거나 사라지면 아래로 떨어져요.
 - **제설차**: 노란 픽셀 제설차가 가끔 Dock 위를 지나가며 눈을 밀어요. 밀린 눈은 날 앞에 쐐기 모양으로 모여 같이 움직여요. 메뉴에서 바로 부를 수도 있어요.
+
+## 스크린샷
+
+> 스크린샷과 데모 GIF는 실제 화면을 캡처한 게 아니라, 코드로 그린 가상 화면(배경·메뉴바·Dock·가짜 창)에 실제 눈 엔진을 돌려 렌더링한 거예요.
+
+| 눈이 쌓인 창과 Dock | 눈 굴려 만든 눈사람 · 제목줄 클릭 눈사람 |
+|---|---|
+| ![눈이 쌓인 창](docs/still-1-snow.png) | ![눈사람](docs/still-3-snowmen.png) |
+| **제설차가 Dock 눈을 밀어 모음** | **눈 더미 끝이 창 모서리를 따라 얇아짐 (확대)** |
+| ![제설차](docs/still-4-plow.png) | ![눈 더미 끝](docs/pile-end-zoom.png) |
 
 ## 요구사항
 
@@ -114,10 +126,18 @@ open /Applications/MacSnow.app
 
 ## 개발
 
-- 코드 전체가 `Sources/main.swift` 한 파일이에요.
+- 앱 코드는 `Sources/main.swift`, 가상 화면 렌더러는 `Sources/Showcase.swift`예요.
 - `open build/MacSnow.app --args --demo`로 실행하면 처음 25초 동안 눈이 빨리 쌓여요(확인용).
 - `tools/notify.sh`: 실행 중인 앱에 디버그 신호를 보내요.
   `plow`(제설차), `spawn`(눈사람), `jump`, `clear`, `fill`(눈 가득), `roll`(눈 굴리기 시연), `dump`(상태를 `$TMPDIR/macsnow-debug.txt`에 기록), `fast`(12초간 드래그 중인 것처럼 60Hz)
+- 스크린샷·데모 다시 만들기: 실제 화면은 캡처하지 않고 가상 화면에 시나리오(눈 쌓임 → 창 드래그 → 눈 굴리기 → 눈사람 점프 → 창 닫기 → 제설차)를 돌려 PNG로 저장해요.
+  ```
+  ./build.sh
+  build/MacSnow.app/Contents/MacOS/MacSnow --showcase showcase-out
+  # showcase-out/frames/f0000.png… (15fps), still-*.png, pile-*-zoom.png
+  ffmpeg -framerate 15 -i showcase-out/frames/f%04d.png \
+    -vf "scale=720:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=96:stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle" docs/demo.gif
+  ```
 - `tools/testwin.swift`: 테스트용 창. `swiftc tools/testwin.swift -o build/testwin && build/testwin` 후 `tools/notify.sh testwin.move`로 창을 움직여 볼 수 있어요.
 
 ## 라이선스
