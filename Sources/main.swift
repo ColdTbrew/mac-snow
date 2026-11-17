@@ -20,10 +20,12 @@ enum Intensity: Int, CaseIterable {
 final class Settings {
     static let shared = Settings()
     private let d = UserDefaults.standard
-    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true]) }
+    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false]) }
     var snowOn: Bool { get { d.bool(forKey: "snowOn") } set { d.set(newValue, forKey: "snowOn") } }
     var snowmenOn: Bool { get { d.bool(forKey: "snowmenOn") } set { d.set(newValue, forKey: "snowmenOn") } }
     var autoPlow: Bool { get { d.bool(forKey: "autoPlow") } set { d.set(newValue, forKey: "autoPlow") } }
+    /// false (default): falling flakes are drawn behind app windows, on the desktop only
+    var flakesOnTop: Bool { get { d.bool(forKey: "flakesOnTop") } set { d.set(newValue, forKey: "flakesOnTop") } }
     var intensity: Intensity {
         get { Intensity(rawValue: d.integer(forKey: "intensity")) ?? .normal }
         set { d.set(newValue.rawValue, forKey: "intensity") }
@@ -352,40 +354,58 @@ func makePlowLayer(px: CGFloat) -> (CALayer, CGFloat) {
 final class Overlay {
     let frame: CGRect          // global coordinates of the screen this overlay covers
     let screen: NSScreen?
-    let window: NSWindow?
+    let window: NSWindow?          // in front: piles, snowmen, plow (sit on window tops / the Dock)
+    let backWindow: NSWindow?      // desktop level: falling flakes, behind every app window
     let root: CALayer
+    let backRoot: CALayer
     let piles = CALayer()
     let actors = CALayer()
     let flakeRoot = CALayer()
 
     /// Offscreen overlay for the showcase renderer: same layers, no window.
     init(virtualFrame: CGRect) {
-        frame = virtualFrame; screen = nil; window = nil
-        root = CALayer()
-        root.frame = CGRect(origin: .zero, size: virtualFrame.size)
-        for l in [piles, actors, flakeRoot] as [CALayer] { l.frame = root.bounds; root.addSublayer(l) }
+        frame = virtualFrame; screen = nil; window = nil; backWindow = nil
+        root = CALayer(); backRoot = CALayer()
+        for r in [root, backRoot] { r.frame = CGRect(origin: .zero, size: virtualFrame.size) }
+        for l in [piles, actors] as [CALayer] { l.frame = root.bounds; root.addSublayer(l) }
+        flakeRoot.frame = root.bounds
+        setFlakesOnTop(Settings.shared.flakesOnTop)
+    }
+
+    static func makeWindow(_ screen: NSScreen, level: Int) -> (NSWindow, CALayer) {
+        let w = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        w.ignoresMouseEvents = true                  // click-through: every click reaches what's below
+        w.level = NSWindow.Level(rawValue: level)
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        w.isReleasedWhenClosed = false
+        let view = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
+        view.wantsLayer = true
+        w.contentView = view
+        w.setFrame(screen.frame, display: false)
+        return (w, view.layer!)
     }
 
     init(screen: NSScreen) {
         self.screen = screen
         frame = screen.frame
-        let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
-        self.window = window
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.ignoresMouseEvents = true                  // click-through: every click reaches the real window
-        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.dockWindow)) + 1) // above Dock, below menu bar & menus
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-        window.isReleasedWhenClosed = false
-        let view = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
-        view.wantsLayer = true
-        root = view.layer!
-        window.contentView = view
-        window.setFrame(screen.frame, display: false)
+        // above Dock, below menu bar & menus
+        (window, root) = Overlay.makeWindow(screen, level: Int(CGWindowLevelForKey(.dockWindow)) + 1)
+        // above the wallpaper and desktop icons, below every normal window
+        (backWindow, backRoot) = Overlay.makeWindow(screen, level: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+        for l in [piles, actors] as [CALayer] { l.frame = root.bounds; root.addSublayer(l) }
+        flakeRoot.frame = root.bounds
+        setFlakesOnTop(Settings.shared.flakesOnTop)
+        window?.orderFrontRegardless()
+    }
 
-        for l in [piles, actors, flakeRoot] as [CALayer] { l.frame = root.bounds; root.addSublayer(l) }
-        window.orderFrontRegardless()
+    /// Falling flakes in front of everything (old behaviour) or behind app windows (default).
+    func setFlakesOnTop(_ top: Bool) {
+        let parent = top ? root : backRoot
+        if flakeRoot.superlayer !== parent { flakeRoot.removeFromSuperlayer(); parent.insertSublayer(flakeRoot, at: top ? 2 : 0) }
+        if top { backWindow?.orderOut(nil) } else { backWindow?.orderFrontRegardless() }
     }
 
     func local(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x - frame.minX, y: p.y - frame.minY) }
@@ -677,7 +697,7 @@ final class Engine {
     }
 
     func rebuildOverlays() {
-        for o in overlays { o.window?.orderOut(nil) }
+        for o in overlays { o.window?.orderOut(nil); o.backWindow?.orderOut(nil) }
         dropAllFlakes()
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
         pileViews.removeAll()
@@ -687,7 +707,12 @@ final class Engine {
         pileDirty = true
     }
 
-    func applySettings() { if !Settings.shared.snowmenOn { removeAllProps() } }
+    func applySettings() {
+        if !Settings.shared.snowmenOn { removeAllProps() }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for o in overlays { o.setFlakesOnTop(Settings.shared.flakesOnTop) }
+        CATransaction.commit()
+    }
 
     func clearSnow() { piles.removeAll(); dropAllFlakes(); pileDirty = true; geometryChanged = true; removeAllProps() }
     func removeAllProps() { props.forEach { $0.remove() }; props.removeAll() }
@@ -1431,6 +1456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(parent)
         add("눈사람 (Snowmen) — 제목줄 클릭 / 눈 굴리기", #selector(toggleSnowmen), on: s.snowmenOn)
         add("제설차 자동 (Auto plow)", #selector(toggleAutoPlow), on: s.autoPlow)
+        add("눈송이 창 위로 (Flakes over windows)", #selector(toggleFlakesOnTop), on: s.flakesOnTop)
         menu.addItem(.separator())
         add("지금 Dock 제설 (Plow the Dock now)", #selector(plowNow))
         add("앞 창에 눈사람 놓기 (Debug)", #selector(debugSpawn))
@@ -1442,6 +1468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleSnow() { Settings.shared.snowOn.toggle(); engine.updateRate() }
     @objc func toggleSnowmen() { Settings.shared.snowmenOn.toggle(); engine.applySettings() }
     @objc func toggleAutoPlow() { Settings.shared.autoPlow.toggle() }
+    @objc func toggleFlakesOnTop() { Settings.shared.flakesOnTop.toggle(); engine.applySettings() }
     @objc func setIntensity(_ i: NSMenuItem) { Settings.shared.intensity = Intensity(rawValue: i.tag) ?? .normal }
     @objc func plowNow() { engine.startPlow() }
     @objc func debugSpawn() { engine.spawnDemoSnowmen() }
