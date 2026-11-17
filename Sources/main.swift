@@ -46,10 +46,21 @@ struct Win {
 protocol WindowProvider {
     func fetch() -> [Win]                 // front-to-back
     func frame(of id: CGWindowID) -> CGRect?
+    func exists(_ id: CGWindowID) -> Bool
+}
+extension WindowProvider {
+    /// The window still exists (maybe on another Space, minimized or hidden), i.e. it wasn't closed.
+    func exists(_ id: CGWindowID) -> Bool { frame(of: id) != nil }
 }
 
 struct SystemWindows: WindowProvider {
     func fetch() -> [Win] { WindowList.fetch() }
+    /// Minimized windows and windows on other Spaces only show up in the full list (not in a
+    /// single-window query), so look there. Called rarely (missing windows, ≤ every 2 s each).
+    func exists(_ id: CGWindowID) -> Bool {
+        let all = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] ?? []
+        return all.contains { ($0[kCGWindowNumber as String] as? CGWindowID) == id }
+    }
     func frame(of id: CGWindowID) -> CGRect? {
         guard let raw = CGWindowListCopyWindowInfo(.optionIncludingWindow, id) as? [[String: Any]],
               let b = raw.first?[kCGWindowBounds as String] as? [String: CGFloat] else { return nil }
@@ -67,6 +78,7 @@ final class SimOverride: WindowProvider {
         WindowList.fetch().map { w in frames[w.id].map { Win(id: w.id, frame: $0, z: w.z, surface: w.surface) } ?? w }
     }
     func frame(of id: CGWindowID) -> CGRect? { frames[id] ?? SystemWindows().frame(of: id) }
+    func exists(_ id: CGWindowID) -> Bool { frames[id] != nil || SystemWindows().exists(id) }
 }
 
 enum WindowList {
@@ -101,6 +113,7 @@ enum DockGeometry {
     static let topInset: CGFloat = 4
     private static var cache: [ObjectIdentifier: ((CGFloat, CGFloat, CGFloat)?, CFTimeInterval)] = [:]
     private static var axFrame: CGRect?
+    static var debugAXFrame: CGRect? { axFrame }
     private static var lastAXCheck: CFTimeInterval = -.infinity
     static func invalidate() { cache.removeAll(); lastAXCheck = -.infinity }
     /// (minX, maxX, topY) in global coords for a screen whose Dock sits at the bottom.
@@ -207,6 +220,8 @@ final class Pile {
     func resize(from old: Surface?, to surf: Surface) -> [(x: CGFloat, y: CGFloat, area: CGFloat)] {
         let n = max(2, Int(surf.width / Pile.step) + 1)
         guard let old else {
+            // a window coming back (other Space, un-minimized) at another width: stretch, don't truncate
+            if heights.count >= 2 && heights.count != n { rescale(to: surf.width); return [] }
             // new surface, or one coming back after a brief absence from the window list: keep what's there
             if heights.count > n { heights.removeLast(heights.count - n); caps.removeLast(caps.count - n) }
             while heights.count < n { heights.append(0); caps.append(cap(heights.count - 1)) }
@@ -257,6 +272,19 @@ final class Pile {
         dirty = true
     }
     func fill() { for i in heights.indices { heights[i] = caps[i] * CGFloat.random(in: 0.92...1) }; dirty = true }
+    /// Stretch/squeeze the profile to a new width without losing snow (scaled or programmatic resizes).
+    func rescale(to width: CGFloat) {
+        let n = max(2, Int(width / Pile.step) + 1), m = heights.count
+        guard m > 1, n != m else { return }
+        func lerp(_ a: [CGFloat], _ i: Int) -> CGFloat {
+            let x = CGFloat(i) * CGFloat(m - 1) / CGFloat(n - 1), j = min(m - 2, Int(x)), t = x - CGFloat(j)
+            return a[j] * (1 - t) + a[j + 1] * t
+        }
+        heights = (0..<n).map { lerp(heights, $0) }
+        caps = (0..<n).map { lerp(caps, $0) }
+        dirty = true
+    }
+
     func relax() {
         guard heights.count > 2 else { return }
         var h = heights
@@ -684,8 +712,63 @@ final class Engine {
     static let snowmanThreshold: CGFloat = 9 * S     // ball radius that turns into a snowman
     static let maxBall: CGFloat = 16 * S
 
+    // MARK: saved state (snow survives quitting / relaunching / updating the app)
+
+    struct SavedPile: Codable { var key: UInt64; var width: Double; var heights: [Float] }
+    struct SavedProp: Codable { var snowman: Bool; var scale: Double; var host: UInt64; var localX: Double; var balls: Bool }
+    struct SavedState: Codable { var time: Date; var piles: [SavedPile]; var props: [SavedProp] }
+    var lastSave: CFTimeInterval = CACurrentMediaTime()
+    static let stateURL: URL = {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("MacSnow")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("state.json")
+    }()
+
+    func saveState() {
+        guard virtualNow == nil else { return }
+        lastSave = CACurrentMediaTime()
+        var ps: [SavedPile] = []
+        for (k, p) in piles where p.mean > 0.05 {
+            let w = surfaces[k]?.width ?? CGFloat(p.heights.count - 1) * Pile.step
+            ps.append(SavedPile(key: k, width: Double(w), heights: p.heights.map { Float(($0 * 10).rounded() / 10) }))
+        }
+        let pr = props.compactMap { m -> SavedProp? in
+            guard let h = m.host, m.grounded else { return nil }
+            return SavedProp(snowman: m.kind == .snowman, scale: Double(m.scale), host: h, localX: Double(m.localX), balls: m.deco != nil)
+        }
+        if let d = try? JSONEncoder().encode(SavedState(time: Date(), piles: ps, props: pr)) {
+            try? d.write(to: Engine.stateURL, options: .atomic)
+        }
+    }
+
+    /// Put back the snow saved by the previous run on windows that are still there (same width).
+    func restoreState() {
+        guard virtualNow == nil, let d = try? Data(contentsOf: Engine.stateURL),
+              let st = try? JSONDecoder().decode(SavedState.self, from: d), Date().timeIntervalSince(st.time) < 30 * 60 else { return }
+        for sp in st.piles {
+            let dock = sp.key >= Engine.dockKey(0)
+            if let surf = surfaces[sp.key] {
+                guard abs(surf.width - CGFloat(sp.width)) < (dock ? 40 : 1) else { continue }
+            } else if dock || !hostAlive(sp.key) { continue }
+            let p = piles[sp.key] ?? Pile()
+            _ = p.resize(from: nil, to: surfaces[sp.key] ?? Surface(key: sp.key, minX: 0, maxX: CGFloat(sp.width), top: 0, z: 0))
+            for i in 0..<min(p.heights.count, sp.heights.count) { p.heights[i] = CGFloat(sp.heights[i]) }
+            p.dirty = true; p.lastSeen = Date()
+            piles[sp.key] = p
+        }
+        for sp in st.props {
+            guard let surf = surfaces[sp.host] else { continue }
+            let m = Prop(kind: sp.snowman ? .snowman : .ball, scale: CGFloat(sp.scale), withBalls: sp.balls)
+            m.grounded = true
+            addProp(m, on: sp.host, atX: surf.minX + CGFloat(sp.localX), fromY: surf.top)
+        }
+        pileDirty = true; geometryChanged = true
+    }
+
     func start() {
         rebuildOverlays()
+        refreshGeometry()
+        restoreState()
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             DockGeometry.invalidate()
             self?.rebuildOverlays()
@@ -903,7 +986,13 @@ final class Engine {
                 segments[k] = visibleSegments(surf)
                 let pile = piles[k] ?? Pile()
                 piles[k] = pile
-                let removed = pile.resize(from: previous[k], to: surf)
+                var removed: [(x: CGFloat, y: CGFloat, area: CGFloat)] = []
+                if let old = previous[k], surf.z >= 0, !mouseIsDown, abs(old.width - surf.width) > 0.001 {
+                    // not a mouse resize (zoom, tiling, Mission Control / lock-screen scaling): keep all the snow
+                    pile.rescale(to: surf.width)
+                } else {
+                    removed = pile.resize(from: previous[k], to: surf)
+                }
                 if pile.dirty { pileDirty = true }
                 if let old = previous[k], !removed.isEmpty { spillSnow(removed, from: old) }
             }
@@ -954,9 +1043,12 @@ final class Engine {
         updateFlakes(dt: dt, now: now)
         updateSpills(dt: dt)
         if tickCount % 10 == 0 { for p in piles.values where p.mean > 0.05 { p.relax() }; pileDirty = true }
+        if virtualNow == nil, now - lastSave > 30 { saveState() }
         if tickCount % 120 == 0 {
-            let cutoff = Date().addingTimeInterval(-3)
-            piles = piles.filter { surfaces[$0.key] != nil || $0.value.lastSeen > cutoff }
+            let cutoff = Date().addingTimeInterval(-3), keepFor = Date().addingTimeInterval(-6 * 3600)
+            piles = piles.filter {
+                surfaces[$0.key] != nil || $0.value.lastSeen > cutoff || ($0.value.lastSeen > keepFor && hostAlive($0.key))
+            }
         }
         updatePlows(dt: dt, now: now)
         updateProps(dt: dt)
@@ -1252,6 +1344,10 @@ final class Engine {
                     m.pos.y += m.vy * dt
                     if m.vy <= 0 && m.pos.y <= ground { m.pos.y = ground; m.vy = 0; m.grounded = true }
                 }
+            } else if let k = m.host, hostAlive(k) {
+                // its window is only out of the list for now (other Space, minimized, hidden): wait for it
+                m.layer.isHidden = true; m.deco?.isHidden = true
+                return false
             } else {
                 // the window it sat on is gone: fall straight down off screen
                 m.host = nil; m.grounded = false
@@ -1262,6 +1358,18 @@ final class Engine {
             place(m)
             return false
         }
+    }
+
+    /// Surface owner still around? Dock keys always; windows: asked at most every 2 s per key.
+    var aliveCache: [UInt64: (Bool, CFTimeInterval)] = [:]
+    func hostAlive(_ k: UInt64) -> Bool {
+        if k >= Engine.dockKey(0) { return true }
+        let now = CACurrentMediaTime()
+        if let c = aliveCache[k], now - c.1 < 2 { return c.0 }
+        let v = windowSource.exists(CGWindowID(k))
+        aliveCache[k] = (v, now)
+        if aliveCache.count > 200 { aliveCache = aliveCache.filter { now - $0.value.1 < 2 } }
+        return v
     }
 
     func overlayIndex(for p: CGPoint) -> Int {
@@ -1553,7 +1661,12 @@ final class Engine {
     /// debug: write surfaces / piles / windows to $TMPDIR/macsnow-debug.txt
     func dump() {
         var out = "interval=\(interval) flakes=\(flakes.count) props=\(props.count) paused=\(paused)\n"
+        out += "axTrusted=\(AXIsProcessTrusted()) dockAX=\(DockGeometry.debugAXFrame.map { "\(Int($0.minX))..\(Int($0.maxX)) top=\(Int($0.maxY))" } ?? "nil")\n"
         for w in wins { out += "win id=\(w.id) z=\(w.z) surface=\(w.surface) frame=\(w.frame)\n" }
+        for (k, p) in piles.sorted(by: { $0.key < $1.key }) where p.mean > 0.05 {
+            out += "pile key=\(k) mean=\(String(format: "%.2f", p.mean)) n=\(p.heights.count) inList=\(surfaces[k] != nil)\n"
+        }
+        for m in props { out += "prop host=\(m.host.map(String.init) ?? "nil") hidden=\(m.layer.isHidden) grounded=\(m.grounded) x=\(Int(m.pos.x))\n" }
         for s in orderedSurfaces {
             let v = pileViews[s.key]
             out += "surf key=\(s.key) z=\(s.z) x=\(Int(s.minX))..\(Int(s.maxX)) top=\(Int(s.top)) mean=\(String(format: "%.2f", piles[s.key]?.mean ?? -1)) segs=\(segments[s.key]?.map { "\(Int($0.0))-\(Int($0.1))" } ?? []) view=\(v != nil) hidden=\(v?.container.isHidden ?? true) masked=\(v?.container.mask != nil)\n"
@@ -1588,7 +1701,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     let menu = NSMenu()
 
+    var termSource: DispatchSourceSignal?
+    func applicationWillTerminate(_ n: Notification) { engine.saveState() }
+
     func applicationDidFinishLaunching(_ n: Notification) {
+        // `kill` / `pkill` / logout: keep the snow for the next launch
+        signal(SIGTERM, SIG_IGN)
+        termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        termSource?.setEventHandler { [weak self] in self?.engine.saveState(); exit(0) }
+        termSource?.resume()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let b = item.button {
             if let img = NSImage(systemSymbolName: "snowflake", accessibilityDescription: "MacSnow") {
@@ -1670,6 +1791,7 @@ for (name, action) in [("plow", { delegate.engine.startPlow() }),
                        ("clear", { delegate.engine.clearSnow() }),
                        ("fill", { delegate.engine.fillAll() }),
                        ("roll", { delegate.engine.demoRoll() }),
+                       ("rebuild", { delegate.engine.rebuildOverlays() }),   // same as a screen-parameter change
                        ("dump", { delegate.engine.dump() }),
                        ("fast", {
                            delegate.engine.refreshGeometry()

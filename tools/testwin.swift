@@ -3,7 +3,7 @@ import AppKit
 // Moves itself when it receives com.coldtbrew.macsnow.testwin.move (simulates a drag of OUR window).
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
-let w = NSWindow(contentRect: NSRect(x: 1250, y: 380, width: 760, height: 420), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+let w = NSWindow(contentRect: NSRect(x: 1250, y: 380, width: 760, height: 420), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
 w.title = "MacSnow test window"
 w.makeKeyAndOrderFront(nil)
 app.activate(ignoringOtherApps: true)
@@ -51,6 +51,17 @@ DistributedNotificationCenter.default().addObserver(forName: Notification.Name("
             }
         }
     }
+}
+// Reset tests: minimize the window for 8 s (it leaves the on-screen list but still exists, like
+// windows on another Space), or scale it without the mouse.
+DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow.testwin.hide"), object: nil, queue: .main) { _ in
+    w.miniaturize(nil)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8) { w.deminiaturize(nil) }
+}
+DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow.testwin.scale"), object: nil, queue: .main) { _ in
+    let f = w.frame
+    w.setFrame(NSRect(x: f.minX + f.width * 0.2, y: f.minY + f.height * 0.2, width: f.width * 0.6, height: f.height * 0.6), display: true)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { w.setFrame(f, display: true) }
 }
 // Title-bar drag that does NOT move the window: MacSnow's snow must stay put.
 DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow.testwin.staticdrag"), object: nil, queue: .main) { _ in
