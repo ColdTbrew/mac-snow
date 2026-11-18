@@ -1894,6 +1894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         item.menu = menu
         engine.start()
+        askDockAccessOncePerBuild()
         if ProcessInfo.processInfo.arguments.contains("--demo") {
             engine.demoBoost = 10
             DispatchQueue.main.asyncAfter(deadline: .now() + 25) { self.engine.demoBoost = 1 }
@@ -1938,6 +1939,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleAutoPlow() { Settings.shared.autoPlow.toggle() }
     @objc func toggleFlakesOnTop() { Settings.shared.flakesOnTop.toggle(); engine.applySettings() }
     @objc func setIntensity(_ i: NSMenuItem) { Settings.shared.intensity = Intensity(rawValue: i.tag) ?? .normal }
+    /// Not trusted yet: show the system Accessibility prompt once per build. A rebuilt (ad-hoc signed)
+    /// binary loses the earlier grant, so the key is the executable's build time. The menu item stays.
+    func askDockAccessOncePerBuild() {
+        guard !AXIsProcessTrusted(), let exe = Bundle.main.executableURL,
+              let built = (try? exe.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { return }
+        let stamp = String(Int(built.timeIntervalSince1970))
+        guard UserDefaults.standard.string(forKey: "axPromptedBuild") != stamp else { return }
+        UserDefaults.standard.set(stamp, forKey: "axPromptedBuild")
+        requestDockAccess()
+    }
     @objc func requestDockAccess() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
