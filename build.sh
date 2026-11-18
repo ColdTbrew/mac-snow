@@ -14,6 +14,7 @@ for ARCH in arm64 x86_64; do
 done
 lipo -create build/obj/MacSnow-arm64 build/obj/MacSnow-x86_64 -output "$APP/Contents/MacOS/MacSnow"
 cp Info.plist "$APP/Contents/Info.plist"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"   # 원본: Resources/AppIcon.svg (tools/make_icns.py)
 codesign -s - --force "$APP"
 echo "built $APP"
 if [[ "${1:-}" == "--run" ]]; then
