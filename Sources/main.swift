@@ -2,6 +2,8 @@
 import AppKit
 import QuartzCore
 import ApplicationServices
+import IOKit.ps
+import ServiceManagement
 
 /// Size scale so things read like the reel on large displays (1.0 on a ~900pt-tall screen).
 var S: CGFloat = {
@@ -12,16 +14,29 @@ var S: CGFloat = {
 // MARK: - Settings
 
 enum Intensity: Int, CaseIterable {
-    case light = 0, normal, heavy
-    var title: String { ["약하게 (Light)", "보통 (Normal)", "많이 (Heavy)"][rawValue] }
+    case light = 0, normal, heavy, blizzard
+    var title: String { ["가랑눈 (Flurries)", "보통 (Normal)", "많이 (Heavy)", "폭설 (Blizzard)"][rawValue] }
     /// flakes per second per 100pt of screen width
-    var flakeRate: CGFloat { [0.6, 1.4, 2.8][rawValue] }
+    var flakeRate: CGFloat { [0.5, 1.4, 2.8, 5.0][rawValue] }
+}
+
+enum BatteryMode: Int, CaseIterable {
+    case auto = 0, always, off
+    var title: String { ["자동 (Auto)", "항상 (Always)", "끄기 (Off)"][rawValue] }
 }
 
 final class Settings {
     static let shared = Settings()
     private let d = UserDefaults.standard
-    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false]) }
+    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 0]) }
+    var windOn: Bool { get { d.bool(forKey: "windOn") } set { d.set(newValue, forKey: "windOn") } }
+    var windStrength: Int { get { max(0, min(2, d.integer(forKey: "windStrength"))) } set { d.set(newValue, forKey: "windStrength") } }
+    var meltOn: Bool { get { d.bool(forKey: "meltOn") } set { d.set(newValue, forKey: "meltOn") } }
+    var meltSpeed: Int { get { max(0, min(2, d.integer(forKey: "meltSpeed"))) } set { d.set(newValue, forKey: "meltSpeed") } }
+    var batteryMode: BatteryMode {
+        get { BatteryMode(rawValue: d.integer(forKey: "batteryMode")) ?? .auto }
+        set { d.set(newValue.rawValue, forKey: "batteryMode") }
+    }
     var snowOn: Bool { get { d.bool(forKey: "snowOn") } set { d.set(newValue, forKey: "snowOn") } }
     var snowmenOn: Bool { get { d.bool(forKey: "snowmenOn") } set { d.set(newValue, forKey: "snowmenOn") } }
     var autoPlow: Bool { get { d.bool(forKey: "autoPlow") } set { d.set(newValue, forKey: "autoPlow") } }
@@ -208,6 +223,9 @@ final class Pile {
     var heights: [CGFloat] = []
     var caps: [CGFloat] = []
     var lastSeen = Date()
+    var created = Date()
+    var icicles: [CGFloat] = []
+    var icicleDirty = true
     private let ph1 = CGFloat.random(in: 0...6.28), ph2 = CGFloat.random(in: 0...6.28)
     /// soft rounded lumps rather than a flat slab
     private func cap(_ i: Int) -> CGFloat {
@@ -532,6 +550,7 @@ final class PileView {
     let under = CAShapeLayer()
     let top = CAShapeLayer()
     let mask = CAShapeLayer()
+    let icicles = CAShapeLayer()
     var width: CGFloat = -1
     var occSig: [CGRect] = []
     var needsPath = true
@@ -542,6 +561,10 @@ final class PileView {
         under.shadowRadius = 2
         under.shadowOffset = CGSize(width: 0, height: -1.5)
         top.fillColor = NSColor.white.cgColor
+        icicles.fillColor = NSColor(calibratedRed: 230 / 255, green: 244 / 255, blue: 1, alpha: 0.9).cgColor
+        icicles.strokeColor = NSColor(calibratedRed: 191 / 255, green: 227 / 255, blue: 1, alpha: 0.9).cgColor
+        icicles.lineWidth = 0.5
+        container.addSublayer(icicles)
         container.addSublayer(under)
         container.addSublayer(top)
     }
@@ -551,6 +574,7 @@ final class PileView {
 
 /// A falling flake: Core Animation moves it (no per-frame CPU work); we only settle it on arrival.
 struct Flake {
+    let overlay: Overlay
     let layer: CALayer
     let startAt: CFTimeInterval
     let fromY: CGFloat, toY: CGFloat       // overlay-local
@@ -680,6 +704,16 @@ final class Engine {
     var interval: Double = 0
     var paused = false
     var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+    var onAC = true
+    var powerSource: CFRunLoopSource?
+    var lastMelt = CACurrentMediaTime()
+    var windMonitor: Any?
+    var windPoint: CGPoint?
+    var windTime: CFTimeInterval = 0
+    var lastGust: CFTimeInterval = -.infinity
+    var lastDust: CFTimeInterval = -.infinity
+    var gustPending = false
+    var windGusts = 0, windDust = 0, windPushed = 0
     var flakePool: [CALayer] = []
     var lastPileDraw: CFTimeInterval = 0
     var windowSource: WindowProvider = SystemWindows()
@@ -776,7 +810,7 @@ final class Engine {
             let p = piles[sp.key] ?? Pile()
             _ = p.resize(from: nil, to: surfaces[sp.key] ?? Surface(key: sp.key, minX: 0, maxX: CGFloat(sp.width), top: 0, z: 0))
             for i in 0..<min(p.heights.count, sp.heights.count) { p.heights[i] = CGFloat(sp.heights[i]) }
-            p.dirty = true; p.lastSeen = Date()
+            p.dirty = true; p.lastSeen = Date(); p.created = .distantPast
             piles[sp.key] = p
         }
         for sp in st.props {
@@ -807,7 +841,7 @@ final class Engine {
     /// 4 Hz when only resting snow has to follow windows, 1 Hz otherwise, and nothing while paused.
     func desiredInterval() -> Double? {
         if paused { return nil }
-        if mouseIsDown || forceFast { return 1.0 / 60 }
+        if mouseIsDown || forceFast { return lowPower ? 1.0 / 30 : 1.0 / 60 }
         if roll != nil || !plows.isEmpty || !spills.isEmpty || props.contains(where: { !$0.grounded }) { return 1.0 / 30 }
         if Settings.shared.snowOn || !flakes.isEmpty { return lowPower ? 1.0 / 4 : 1.0 / 8 }
         if !props.isEmpty || piles.values.contains(where: { $0.mean > 0.05 }) { return 1.0 / 4 }
@@ -851,6 +885,12 @@ final class Engine {
 
     /// Stop all work while displays sleep, the screen is locked or the session is switched out.
     func installPowerObservers() {
+        powerSource = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context else { return }
+            Unmanaged<Engine>.fromOpaque(context).takeUnretainedValue().updatePower()
+        }, Unmanaged.passUnretained(self).toOpaque())?.takeRetainedValue()
+        if let source = powerSource { CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes) }
+        updatePower()
         let ws = NSWorkspace.shared.notificationCenter
         for n in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
             ws.addObserver(forName: n, object: nil, queue: .main) { _ in DockGeometry.invalidate() }   // Dock width changes
@@ -864,9 +904,21 @@ final class Engine {
         dnc.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.setPaused(true) }
         dnc.addObserver(forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main) { [weak self] _ in self?.setPaused(false) }
         NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [weak self] _ in
-            self?.lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
-            self?.updateRate()
+            self?.updatePower()
         }
+    }
+
+    func updatePower() {
+        if let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+           let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() {
+            onAC = (type as String) == kIOPMACPowerKey
+        }
+        switch Settings.shared.batteryMode {
+        case .always: lowPower = true
+        case .off: lowPower = false
+        case .auto: lowPower = !onAC || ProcessInfo.processInfo.isLowPowerModeEnabled
+        }
+        updateRate()
     }
 
     let noPause = ProcessInfo.processInfo.arguments.contains("--nopause")   // debug: measure CPU while locked
@@ -882,6 +934,7 @@ final class Engine {
     func setPaused(_ p: Bool) {
         guard p != paused, !noPause else { return }
         paused = p
+        lastMelt = clock(); windPoint = nil
         pauseWatch?.invalidate(); pauseWatch = nil
         if p {
             // every 2 s while paused: resume if we are actually unlocked and awake
@@ -898,7 +951,7 @@ final class Engine {
     func dropAllFlakes() {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         for f in flakes { f.layer.removeAllAnimations(); f.layer.removeFromSuperlayer(); flakePool.append(f.layer) }
-        for f in spills { f.layer.removeFromSuperlayer(); flakePool.append(f.layer) }
+        for f in spills { f.layer.removeFromSuperlayer(); f.layer.opacity = 1; flakePool.append(f.layer) }
         spills.removeAll()
         CATransaction.commit()
         flakes.removeAll()
@@ -916,6 +969,9 @@ final class Engine {
     }
 
     func applySettings() {
+        updateWindMonitor()
+        lastMelt = clock()
+        for v in pileViews.values { v.icicles.isHidden = !Settings.shared.meltOn }
         if !Settings.shared.snowmenOn { removeAllProps() }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         for o in overlays { o.setFlakesOnTop(Settings.shared.flakesOnTop) }
@@ -1066,6 +1122,10 @@ final class Engine {
             if tickCount % 8 == 0 { refreshGeometry() } else { refreshDragged() }
         } else if tickCount % max(1, Int(0.25 / max(interval, 0.001))) == 0 { refreshGeometry() }
         CATransaction.begin(); CATransaction.setDisableActions(true)
+        if virtualNow == nil, !paused, now - lastMelt >= 2 {
+            let elapsed = now - lastMelt; lastMelt = now
+            meltStep(seconds: elapsed)
+        }
         updateFlakes(dt: dt, now: now)
         updateSpills(dt: dt)
         if tickCount % 10 == 0 { for p in piles.values where p.mean > 0.05 { p.relax() }; pileDirty = true }
@@ -1085,6 +1145,158 @@ final class Engine {
         }
         CATransaction.commit()
         updateRate()
+    }
+
+    func updateWindMonitor() {
+        if let monitor = windMonitor, !Settings.shared.windOn {
+            NSEvent.removeMonitor(monitor); windMonitor = nil; windPoint = nil
+        } else if Settings.shared.windOn, windMonitor == nil {
+            windMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
+                self?.mouseWind(at: NSEvent.mouseLocation)
+            }
+        }
+    }
+
+    func mouseWind(at p: CGPoint) {
+        guard Settings.shared.windOn, !paused else { return }
+        let now = clock(), previous = windPoint, elapsed = now - windTime
+        windPoint = p; windTime = now
+        guard let q = previous, elapsed > 0, elapsed < 0.2,
+              !(mouseIsDown && (roll != nil || carry != nil || drag != nil)),
+              !gustPending, now - lastGust >= 1.0 / 15 else { return }
+        let velocity = CGPoint(x: (p.x - q.x) / CGFloat(elapsed), y: (p.y - q.y) / CGFloat(elapsed))
+        let strength: CGFloat = [0.7, 1, 1.4][Settings.shared.windStrength]
+        guard hypot(velocity.x, velocity.y) > 1200 / strength else { return }
+        gustPending = true
+        // Keep the event handler constant-time; at most one bounded gust can be queued.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.gustPending = false
+            self.windGust(at: p, velocity: velocity)
+        }
+    }
+
+    func windGust(at p: CGPoint, velocity: CGPoint) {
+        guard Settings.shared.windOn, !paused, !overlays.isEmpty,
+              p.x.isFinite, p.y.isFinite, velocity.x.isFinite, velocity.y.isFinite,
+              !(mouseIsDown && (roll != nil || carry != nil || drag != nil)) else { return }
+        let now = clock()
+        let strength: CGFloat = [0.7, 1, 1.4][Settings.shared.windStrength]
+        guard now - lastGust >= 1.0 / 15, hypot(velocity.x, velocity.y) > 1200 / strength else { return }
+        lastGust = now; windGusts += 1
+        let radius = 140 * S * strength
+        let impulse = max(-60 * S * strength, min(60 * S * strength, velocity.x * 0.025 * strength))
+        var pushed = 0
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        for i in flakes.indices {
+            if pushed >= 120 { break }
+            let f = flakes[i], o = f.overlay
+            guard now < f.arriveAt - 0.12 else { continue }
+            let current = virtualNow == nil ? (f.layer.presentation()?.position ?? f.layer.position) : f.layer.position
+            let global = CGPoint(x: current.x + o.frame.minX, y: current.y + o.frame.minY)
+            let distance = hypot(global.x - p.x, global.y - p.y)
+            guard distance < radius else { continue }
+            let x = global.x + impulse * (1 - distance / radius)
+            let r = f.layer.bounds.width / 2
+            let surface = landingSurface(at: x, below: global.y, above: o.frame.minY)
+            let lx = surface.map { x - $0.minX } ?? 0
+            let endY = surface.map { $0.top + (piles[$0.key]?.height(at: lx) ?? 0) + r * 0.3 } ?? (o.frame.minY - 2 * r)
+            let speed = (f.fromY - f.toY) / CGFloat(max(0.001, f.arriveAt - 0.12 - f.startAt))
+            let duration = Double(max(0, global.y - endY) / max(1, speed))
+            f.layer.removeAnimation(forKey: "fall")
+            f.layer.position = CGPoint(x: x - o.frame.minX, y: virtualNow == nil ? endY - o.frame.minY : current.y)
+            if virtualNow == nil {
+                let fall = CABasicAnimation(keyPath: "position.y")
+                fall.fromValue = current.y; fall.toValue = endY - o.frame.minY; fall.duration = duration
+                f.layer.add(fall, forKey: "fall")
+                let push = CABasicAnimation(keyPath: "position.x")
+                push.fromValue = current.x; push.toValue = x - o.frame.minX; push.duration = 0.18
+                push.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                f.layer.add(push, forKey: "wind")
+            }
+            flakes[i] = Flake(overlay: o, layer: f.layer, startAt: now, fromY: current.y, toY: endY - o.frame.minY,
+                              arriveAt: now + duration + 0.12, key: surface?.key, localX: lx, area: f.area)
+            pushed += 1; windPushed += 1
+        }
+        // Six particles per 0.1 s bounds continuous wiping to 60 particles/s.
+        if now - lastDust >= 0.1, abs(velocity.x) > 300,
+           let surf = orderedSurfaces.first(where: { s in
+               guard let pile = piles[s.key], isVisible(s.key, p.x) else { return false }
+               let h = pile.height(at: p.x - s.minX)
+               return h > 0.05 && p.y >= s.top && p.y <= s.top + h + 12 * S * strength
+           }), let pile = piles[surf.key] {
+            lastDust = now
+            let x = p.x - surf.minX
+            let area = pile.take(from: x - 10 * S, to: x + 10 * S, fraction: 0.012)
+            if area > 0 {
+                pileDirty = true
+                for _ in 0..<6 {
+                    let pos = CGPoint(x: p.x + .random(in: -8...8) * S, y: surf.top + pile.height(at: x))
+                    let o = overlays[overlayIndex(for: pos)], layer = flakeLayer()
+                    let r = CGFloat.random(in: 0.8...1.6) * S
+                    layer.bounds = CGRect(x: 0, y: 0, width: r * 2, height: r * 2)
+                    layer.cornerRadius = r; layer.position = o.local(pos)
+                    o.actors.addSublayer(layer)
+                    spills.append(Spill(layer: layer, pos: pos, vy: .random(in: 65...120) * S,
+                                        vx: max(-280 * S, min(280 * S, velocity.x * 0.08)),
+                                        area: 0, source: surf.key, fromDock: true, ttl: .random(in: 0.45...0.65)))
+                    windDust += 1
+                }
+            }
+        }
+        CATransaction.commit()
+        updateRate()
+    }
+
+    func icicleSite(_ key: UInt64, _ index: Int) -> (x: CGFloat, cap: CGFloat) {
+        let seed = (key &* 1664525 &+ UInt64(index) &* 1013904223) & 0xffff
+        let fraction = CGFloat(seed) / 65535
+        return ((25 + CGFloat(index) * 58 + fraction * 12) * S, (10 + fraction * 12) * S)
+    }
+
+    /// Explicit calls also drive the debug and virtual-desktop melt scenes.
+    func meltStep(seconds: CFTimeInterval) {
+        guard Settings.shared.meltOn, !paused, seconds > 0 else { return }
+        let amount = [CGFloat(0.4), 1.2, 3.0][Settings.shared.meltSpeed] * S * CGFloat(seconds) / 60
+        for (key, pile) in piles where Date().timeIntervalSince(pile.created) >= 180 {
+            guard pile.heights.contains(where: { $0 > 0 }) || pile.icicles.contains(where: { $0 > 0 }) else { continue }
+            let before = pile.heights
+            for i in pile.heights.indices { pile.heights[i] = max(0, pile.heights[i] - amount) }
+            pile.dirty = true; pileDirty = true
+            guard key < Engine.dockKey(0), let surf = surfaces[key] else { continue }
+            let count = max(0, Int((surf.width / S - 25) / 58))
+            if pile.icicles.count != count {
+                pile.icicles = Array(pile.icicles.prefix(count))
+                while pile.icicles.count < count { pile.icicles.append(0) }
+                pile.icicleDirty = true
+            }
+            let empty = !before.contains { $0 > 0.05 }
+            for i in pile.icicles.indices {
+                let site = icicleSite(key, i), bin = min(before.count - 1, max(0, pile.index(site.x)))
+                guard bin >= 0 else { continue }
+                let old = pile.icicles[i]
+                if empty {
+                    pile.icicles[i] = max(0, old - amount * 2)
+                } else if before[bin] > 0, isVisible(key, surf.minX + site.x) {
+                    pile.icicles[i] = min(site.cap, old + (before[bin] - pile.heights[bin]) * 4)
+                }
+                if old != pile.icicles[i] { pile.icicleDirty = true }
+            }
+        }
+    }
+
+    func iciclePath(_ surf: Surface, _ pile: Pile) -> CGPath {
+        let path = CGMutablePath()
+        guard surf.z >= 0 else { return path }
+        for i in pile.icicles.indices where pile.icicles[i] > 0 {
+            let x = icicleSite(surf.key, i).x, length = pile.icicles[i]
+            guard x < surf.width - 12 * S, isVisible(surf.key, surf.minX + x) else { continue }
+            let half = min(2.2 * S, length * 0.18)
+            path.move(to: CGPoint(x: x - half, y: 0))
+            path.addLine(to: CGPoint(x: x, y: -length))
+            path.addLine(to: CGPoint(x: x + half, y: 0)); path.closeSubpath()
+        }
+        return path
     }
 
     // MARK: flakes
@@ -1115,7 +1327,8 @@ final class Engine {
             flakes = kept
         }
         guard Settings.shared.snowOn else { return }
-        let rate = Settings.shared.intensity.flakeRate * (lowPower ? 0.5 : 1)
+        let intensity = Settings.shared.intensity
+        let rate = (lowPower && intensity == .blizzard ? Intensity.heavy : intensity).flakeRate * (lowPower ? 0.5 : 1)
         // highest surfaces first: a flake crossing a window top sticks with some chance, otherwise
         // keeps falling in front of it to the windows / Dock further down (windows are layered).
         for o in overlays {
@@ -1123,6 +1336,7 @@ final class Engine {
             spawnDebt += rate * f.width / 100 * dt
             while spawnDebt >= 1 {
                 spawnDebt -= 1
+                if flakes.count >= 700 { spawnDebt = 0; break }
                 let x = CGFloat.random(in: f.minX...f.maxX)
                 let r = CGFloat.random(in: 1.3...2.7) * S
                 let v = CGFloat.random(in: 52...80) * (0.85 + 0.15 * S)
@@ -1150,7 +1364,7 @@ final class Engine {
                     a.duration = dur
                     layer.add(a, forKey: "fall")
                 } else { layer.position.y = startY - f.minY }
-                flakes.append(Flake(layer: layer, startAt: now, fromY: startY - f.minY, toY: endY - f.minY,
+                flakes.append(Flake(overlay: o, layer: layer, startAt: now, fromY: startY - f.minY, toY: endY - f.minY,
                                     arriveAt: now + dur + 0.12, key: key, localX: lx,
                                     area: 0.6 * .pi * r * r))
             }
@@ -1304,7 +1518,7 @@ final class Engine {
     func clipPath(_ surf: Surface) -> CGPath? {
         guard surf.z > 0 else { return nil }
         let R = Engine.windowCorner
-        let band = CGRect(x: surf.minX - 12, y: surf.top - R - 8, width: surf.width + 24, height: Pile.maxH + R + 24)
+        let band = CGRect(x: surf.minX - 12, y: surf.top - max(R + 8, 24 * S), width: surf.width + 24, height: Pile.maxH + max(R + 8, 24 * S) + 16)
         var occ: CGPath?
         for w in wins where w.z < surf.z && w.frame.intersects(band) {
             let rr = CGPath(roundedRect: w.frame, cornerWidth: R, cornerHeight: R, transform: nil)
@@ -1317,7 +1531,7 @@ final class Engine {
     /// Windows in front whose shape cuts this surface's snow, relative to the surface origin.
     func occluderSignature(_ surf: Surface) -> [CGRect] {
         guard surf.z > 0 else { return [] }
-        let band = CGRect(x: surf.minX - 12, y: surf.top - Engine.windowCorner - 8, width: surf.width + 24, height: Pile.maxH + Engine.windowCorner + 24)
+        let band = CGRect(x: surf.minX - 12, y: surf.top - max(Engine.windowCorner + 8, 24 * S), width: surf.width + 24, height: Pile.maxH + max(Engine.windowCorner + 8, 24 * S) + 16)
         return wins.filter { $0.z < surf.z && $0.frame.intersects(band) }.map { $0.frame.offsetBy(dx: -surf.minX, dy: -surf.top) }
     }
 
@@ -1330,7 +1544,7 @@ final class Engine {
         }
         for (k, surf) in surfaces {
             guard let pile = piles[k], pile.heights.count > 1 else { continue }
-            let empty = pile.mean <= 0.05 || (segments[k] ?? []).isEmpty
+            let empty = (pile.mean <= 0.05 && !pile.icicles.contains { $0 > 0 }) || (segments[k] ?? []).isEmpty
             if empty { if let v = pileViews[k] { v.container.isHidden = true }; continue }
             let view = pileViews[k] ?? PileView()
             pileViews[k] = view
@@ -1352,6 +1566,11 @@ final class Engine {
                         view.container.mask = view.mask
                     } else { view.container.mask = nil }
                 }
+            }
+            view.icicles.isHidden = !Settings.shared.meltOn
+            if pile.icicleDirty || geometryChanged || widthChanged || view.needsPath {
+                view.icicles.path = iciclePath(surf, pile)
+                pile.icicleDirty = false
             }
             if paths && (pile.dirty || view.needsPath) || widthChanged {
                 pile.dirty = false; view.needsPath = false; view.width = surf.width
@@ -1708,8 +1927,9 @@ final class Engine {
     func topWindow(at p: CGPoint, in list: [Win]) -> Win? { list.first { $0.frame.contains(p) }.flatMap { $0.surface ? $0 : nil } }
 
     func installMouseMonitors() {
+        updateWindMonitor()
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in self?.mouseDown(at: NSEvent.mouseLocation) }
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] _ in self?.mouseDragged(to: NSEvent.mouseLocation) }
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] _ in self?.mouseDragged(to: NSEvent.mouseLocation); self?.mouseWind(at: NSEvent.mouseLocation) }
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in self?.mouseUp(at: NSEvent.mouseLocation) }
     }
 
@@ -1836,6 +2056,13 @@ final class Engine {
     /// debug: write surfaces / piles / windows to $TMPDIR/macsnow-debug.txt
     func dump() {
         var out = "interval=\(interval) flakes=\(flakes.count) props=\(props.count) paused=\(paused)\n"
+        let settings = Settings.shared
+        out += "settings intensity=\(settings.intensity.rawValue) wind=\(settings.windOn)/\(settings.windStrength) melt=\(settings.meltOn)/\(settings.meltSpeed) battery=\(settings.batteryMode.rawValue) lowPower=\(lowPower) onAC=\(onAC) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled) login=\(SMAppService.mainApp.status.rawValue)\n"
+        out += "wind gusts=\(windGusts) pushed=\(windPushed) dust=\(windDust)\n"
+        for (k, p) in piles where k < Engine.dockKey(0) {
+            let lengths = p.icicles.filter { $0 > 0 }
+            if let longest = lengths.max() { out += "icicles key=\(k) n=\(lengths.count) maxLen=\(longest)\n" }
+        }
         out += "axTrusted=\(AXIsProcessTrusted()) dockAX=\(DockGeometry.debugAXFrame.map { "\(Int($0.minX))..\(Int($0.maxX)) top=\(Int($0.maxY))" } ?? "nil")\n"
         for w in wins { out += "win id=\(w.id) z=\(w.z) surface=\(w.surface) frame=\(w.frame)\n" }
         for (k, p) in piles.sorted(by: { $0.key < $1.key }) where p.mean > 0.05 {
@@ -1920,6 +2147,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let parent = NSMenuItem(title: "세기 (Intensity)", action: nil, keyEquivalent: "")
         parent.submenu = sub
         menu.addItem(parent)
+        func choices(_ title: String, _ titles: [String], _ selected: Int, _ action: Selector) {
+            let submenu = NSMenu()
+            for (tag, title) in titles.enumerated() {
+                let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
+                i.target = self; i.tag = tag; i.state = tag == selected ? .on : .off
+                submenu.addItem(i)
+            }
+            let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            i.submenu = submenu; menu.addItem(i)
+        }
+        add("마우스 바람 (Mouse wind)", #selector(toggleWind), on: s.windOn)
+        choices("바람 세기 (Wind strength)", ["약하게 (Gentle)", "보통 (Normal)", "세게 (Strong)"], s.windStrength, #selector(setWindStrength(_:)))
+        add("녹기·고드름 (Melting & icicles)", #selector(toggleMelt), on: s.meltOn)
+        choices("녹는 속도 (Melt speed)", ["느리게 (Slow)", "보통 (Normal)", "빠르게 (Fast)"], s.meltSpeed, #selector(setMeltSpeed(_:)))
+        choices("배터리 절약 (Battery saving)", BatteryMode.allCases.map { $0.title }, s.batteryMode.rawValue, #selector(setBatteryMode(_:)))
+        add("로그인 시 자동 실행 (Launch at login)", #selector(toggleLogin), on: SMAppService.mainApp.status == .enabled)
         add("눈사람 (Snowmen) — 제목줄 클릭 / 눈 굴리기", #selector(toggleSnowmen), on: s.snowmenOn)
         add("제설차 자동 (Auto plow)", #selector(toggleAutoPlow), on: s.autoPlow)
         add("눈송이 창 위로 (Flakes over windows)", #selector(toggleFlakesOnTop), on: s.flakesOnTop)
@@ -1934,11 +2177,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("종료 (Quit)", #selector(quit), key: "q")
     }
 
+    @objc func toggleWind() { Settings.shared.windOn.toggle(); engine.updateWindMonitor() }
+    @objc func setWindStrength(_ i: NSMenuItem) { Settings.shared.windStrength = i.tag }
+    @objc func toggleMelt() { Settings.shared.meltOn.toggle(); engine.applySettings() }
+    @objc func setMeltSpeed(_ i: NSMenuItem) { Settings.shared.meltSpeed = i.tag; engine.lastMelt = engine.clock() }
+    @objc func setBatteryMode(_ i: NSMenuItem) { Settings.shared.batteryMode = BatteryMode(rawValue: i.tag) ?? .auto; engine.updatePower() }
+    @objc func toggleLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled { try service.unregister() } else { try service.register() }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "로그인 시 자동 실행 (Launch at login)"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+        if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+    }
     @objc func toggleSnow() { Settings.shared.snowOn.toggle(); engine.updateRate() }
     @objc func toggleSnowmen() { Settings.shared.snowmenOn.toggle(); engine.applySettings() }
     @objc func toggleAutoPlow() { Settings.shared.autoPlow.toggle() }
     @objc func toggleFlakesOnTop() { Settings.shared.flakesOnTop.toggle(); engine.applySettings() }
-    @objc func setIntensity(_ i: NSMenuItem) { Settings.shared.intensity = Intensity(rawValue: i.tag) ?? .normal }
+    @objc func setIntensity(_ i: NSMenuItem) { Settings.shared.intensity = Intensity(rawValue: i.tag) ?? .normal; engine.updateRate() }
     /// Not trusted yet: show the system Accessibility prompt once per build. A rebuilt (ad-hoc signed)
     /// binary loses the earlier grant, so the key is the executable's build time. The menu item stays.
     func askDockAccessOncePerBuild() {
@@ -1972,6 +2232,10 @@ app.delegate = delegate
 app.setActivationPolicy(.accessory)
 // Debug control channel (see notify.sh): plow, spawn, balls, jump, clear, fill, roll
 for (name, action) in [("plow", { delegate.engine.startPlow() }),
+                       ("melt.fast", {
+                           delegate.engine.piles.values.forEach { $0.created = .distantPast }
+                           delegate.engine.meltStep(seconds: 600)
+                       }),
                        ("spawn", { delegate.engine.spawnDemoSnowmen() }),
                        ("balls", { delegate.engine.spawnDemoBalls() }),
                        ("jump", { delegate.engine.jumpAll() }),
@@ -1989,6 +2253,11 @@ for (name, action) in [("plow", { delegate.engine.startPlow() }),
     DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow." + name), object: nil, queue: .main) { _ in
         CATransaction.begin(); CATransaction.setDisableActions(true); action(); CATransaction.commit()
     }
+}
+DistributedNotificationCenter.default().addObserver(forName: Notification.Name("com.coldtbrew.macsnow.wind.gust"), object: nil, queue: .main) { n in
+    let c = ((n.object as? String) ?? "").split(separator: ",").compactMap { Double($0) }
+    guard c.count == 4, c.allSatisfy({ $0.isFinite }) else { return }
+    delegate.engine.windGust(at: CGPoint(x: c[0], y: c[1]), velocity: CGPoint(x: c[2], y: c[3]))
 }
 // Simulated mouse for drag-lag measurement (tools/testwin.swift lagtest):
 // object = "x,y,windowID,fx,fy,fw,fh" (mouse point + the test window's real frame, AppKit global)

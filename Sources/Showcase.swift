@@ -29,7 +29,7 @@ enum Showcase {
 
     static func run(outDir: String) {
         // fixed settings for the run only (argument domain: never written to disk)
-        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false],
+        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 2],
                                                 forName: UserDefaults.argumentDomain)
         S = 1.15
         dockRect = CGRect(x: 455, y: 6, width: 530, height: 64)
@@ -166,6 +166,37 @@ enum Showcase {
             engine.mouseUp(at: end)
             step(15, record: true)
             still("still-6-stacked")
+        }
+        // 10) quick sweeps push falling snow and lift dust off Music's pile.
+        if let surf = engine.surfaces[2] {
+            engine.piles[2]?.fill(); engine.pileDirty = true
+            step(30, record: true) { i in
+                if i % 3 == 0 {
+                    let x = 40 + CGFloat(i) * 45
+                    engine.windGust(at: CGPoint(x: x, y: 490), velocity: CGPoint(x: 2600, y: 0))
+                }
+            }
+            step(9, record: true) { i in
+                if i % 3 == 0 {
+                    engine.windGust(at: CGPoint(x: surf.minX + 100 + CGFloat(i) * 15, y: surf.top + 8),
+                                    velocity: CGPoint(x: 3000, y: 0))
+                }
+            }
+            still("still-8-wind")
+            still("wind-dust-zoom", scale: 3, crop: CGRect(x: surf.minX + 40, y: surf.top - 20, width: 320, height: 90))
+            print("wind gusts=\(engine.windGusts) pushed=\(engine.windPushed) dust=\(engine.windDust)")
+            // 11) ten simulated minutes lower the pile and feed the hanging icicles.
+            var settings = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+            settings["meltSpeed"] = 0
+            UserDefaults.standard.setVolatileDomain(settings, forName: UserDefaults.argumentDomain)
+            engine.piles[2]?.fill()
+            engine.piles[2]?.created = .distantPast
+            let before = engine.piles[2]?.mean ?? 0
+            step(30, record: true) { _ in engine.meltStep(seconds: 20) }
+            still("still-9-icicles")
+            still("icicles-zoom", scale: 3, crop: CGRect(x: surf.minX + 10, y: surf.top - 30, width: 380, height: 70))
+            let ic = engine.piles[2]?.icicles.filter { $0 > 0 } ?? []
+            print("melt mean \(before) -> \(engine.piles[2]?.mean ?? 0), icicles n=\(ic.count) max=\(ic.max() ?? 0)")
         }
         print("showcase: \(frameNo) frames -> \(outDir)")
     }
