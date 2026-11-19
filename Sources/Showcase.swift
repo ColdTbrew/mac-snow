@@ -29,7 +29,7 @@ enum Showcase {
 
     static func run(outDir: String) {
         // fixed settings for the run only (argument domain: never written to disk)
-        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 2],
+        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 2, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue],
                                                 forName: UserDefaults.argumentDomain)
         S = 1.15
         dockRect = CGRect(x: 455, y: 6, width: 530, height: 64)
@@ -197,6 +197,29 @@ enum Showcase {
             still("icicles-zoom", scale: 3, crop: CGRect(x: surf.minX + 10, y: surf.top - 30, width: 380, height: 70))
             let ic = engine.piles[2]?.icicles.filter { $0 > 0 } ?? []
             print("melt mean \(before) -> \(engine.piles[2]?.mean ?? 0), icicles n=\(ic.count) max=\(ic.max() ?? 0)")
+        }
+        // 12) grab Music by its title bar and shake it: the snow and its snowman fly off.
+        let mi = fake.index(2)
+        if let surf = engine.surfaces[2] {
+            engine.piles[2]?.fill(); engine.pileDirty = true
+            engine.spawnSnowman(onSurface: surf.key, atX: surf.minX + surf.width * 0.6, fromY: surf.top + 30 * S)
+            step(30, record: true)
+            let before = engine.piles[2]?.mean ?? 0
+            let origin = fake.list[mi].frame.origin
+            let grab = CGPoint(x: surf.minX + 200, y: surf.top - 12)
+            engine.mouseDown(at: grab)
+            var shook = false
+            step(30 * 2, record: true) { i in
+                let tt = CGFloat(i + 1) / 30
+                let dx = 70 * sin(2 * .pi * 2.6 * tt) * min(1, tt * 3)
+                fake.list[mi].frame.origin = CGPoint(x: origin.x + dx, y: origin.y)
+                engine.mouseDragged(to: CGPoint(x: grab.x + dx, y: grab.y))
+                if !shook, (engine.piles[2]?.mean ?? 0) < before * 0.6 { shook = true; still("still-10-shake") }
+            }
+            fake.list[mi].frame.origin = origin
+            engine.mouseUp(at: grab)
+            step(30 * 2, record: true)
+            print("shake mean \(before) -> \(engine.piles[2]?.mean ?? 0), props on Music: \(engine.props.filter { $0.host == 2 }.count)")
         }
         print("showcase: \(frameNo) frames -> \(outDir)")
     }
