@@ -25,14 +25,29 @@ enum BatteryMode: Int, CaseIterable {
     var title: String { ["자동 (Auto)", "항상 (Always)", "끄기 (Off)"][rawValue] }
 }
 
+enum ShakeStrength: Int, CaseIterable {
+    case gentle = 0, normal, strong
+    var title: String { ["약하게 (Gentle)", "보통 (Normal)", "세게 (Strong)"][rawValue] }
+
+    func shedFraction(strokeStrength: CGFloat, repeated: Bool) -> CGFloat {
+        let base: CGFloat = [0.16, 0.26, 0.38][rawValue]
+        let limit: CGFloat = [0.65, 0.85, 0.95][rawValue]
+        return min(limit, base * strokeStrength * (repeated ? 1.5 : 1))
+    }
+}
+
 final class Settings {
     static let shared = Settings()
     private let d = UserDefaults.standard
-    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 0, "shakeOn": true]) }
+    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 0, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue]) }
     var windOn: Bool { get { d.bool(forKey: "windOn") } set { d.set(newValue, forKey: "windOn") } }
     var windStrength: Int { get { max(0, min(2, d.integer(forKey: "windStrength"))) } set { d.set(newValue, forKey: "windStrength") } }
     /// shaking a window by its title bar knocks its snow (and snowmen) off
     var shakeOn: Bool { get { d.bool(forKey: "shakeOn") } set { d.set(newValue, forKey: "shakeOn") } }
+    var shakeStrength: ShakeStrength {
+        get { ShakeStrength(rawValue: d.integer(forKey: "shakeStrength")) ?? .normal }
+        set { d.set(newValue.rawValue, forKey: "shakeStrength") }
+    }
     var meltOn: Bool { get { d.bool(forKey: "meltOn") } set { d.set(newValue, forKey: "meltOn") } }
     var meltSpeed: Int { get { max(0, min(2, d.integer(forKey: "meltSpeed"))) } set { d.set(newValue, forKey: "meltSpeed") } }
     var batteryMode: BatteryMode {
@@ -2153,15 +2168,19 @@ final class Engine {
         let hx = turned(s.v.x, &s.peak.x), hy = turned(s.v.y, &s.peak.y)
         guard hx != nil || hy != nil else { return }
         let fling = CGPoint(x: hx ?? 0, y: hy ?? 0)
-        let speed = max(abs(fling.x), abs(fling.y))
         s.jolts = s.jolts.filter { now - $0 < 0.9 } + [now]
         shakeJolts += 1
         // one back-and-forth while positioning a window (even a fast fling + correction) isn't a shake
         guard s.jolts.count >= 2 else { return }
         s.shed += 1; shakeSheds += 1
-        let strength = min(2.5, speed / Engine.shakeSpeed)
-        shakeOff(UInt64(d.id), fraction: min(0.65, 0.16 * strength * (s.jolts.count >= 3 ? 1.5 : 1)),
-                 fling: fling, knockProps: s.shed >= 2)
+        shedFromShake(UInt64(d.id), fling: fling, repeated: s.jolts.count >= 3, knockProps: s.shed >= 2)
+    }
+
+    private func shedFromShake(_ key: UInt64, fling: CGPoint, repeated: Bool, knockProps: Bool) {
+        let speed = max(abs(fling.x), abs(fling.y))
+        let strokeStrength = min(2.5, speed / Engine.shakeSpeed)
+        let fraction = Settings.shared.shakeStrength.shedFraction(strokeStrength: strokeStrength, repeated: repeated)
+        shakeOff(key, fraction: fraction, fling: fling, knockProps: knockProps)
     }
 
     /// Knock `fraction` of a surface's snow off as tumbling clumps that keep the window's momentum
@@ -2285,7 +2304,7 @@ final class Engine {
     /// debug: shake the front window's snow off (as if it were shaken left-right hard)
     func demoShake() {
         guard let w = demoTargets().first else { return }
-        shakeOff(UInt64(w.id), fraction: 0.4, fling: CGPoint(x: 1400, y: 0), knockProps: true)
+        shedFromShake(UInt64(w.id), fling: CGPoint(x: 1400, y: 0), repeated: true, knockProps: true)
     }
 
     /// debug: write surfaces / piles / windows to $TMPDIR/macsnow-debug.txt
@@ -2295,7 +2314,7 @@ final class Engine {
         out += "settings intensity=\(settings.intensity.rawValue) wind=\(settings.windOn)/\(settings.windStrength) melt=\(settings.meltOn)/\(settings.meltSpeed) battery=\(settings.batteryMode.rawValue) lowPower=\(lowPower) onAC=\(onAC) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled) login=\(SMAppService.mainApp.status.rawValue)\n"
         out += "wind gusts=\(windGusts) pushed=\(windPushed) dust=\(windDust)\n"
         out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1)\n"
-        out += "shake on=\(settings.shakeOn) jolts=\(shakeJolts) sheds=\(shakeSheds) drags=\(dragCount)\n"
+        out += "shake on=\(settings.shakeOn) strength=\(settings.shakeStrength.rawValue) jolts=\(shakeJolts) sheds=\(shakeSheds) drags=\(dragCount)\n"
         for (k, p) in piles where k < Engine.dockKey(0) {
             let lengths = p.icicles.filter { $0 > 0 }
             if let longest = lengths.max() { out += "icicles key=\(k) n=\(lengths.count) maxLen=\(longest)\n" }
@@ -2397,6 +2416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("마우스 바람 (Mouse wind)", #selector(toggleWind), on: s.windOn)
         choices("바람 세기 (Wind strength)", ["약하게 (Gentle)", "보통 (Normal)", "세게 (Strong)"], s.windStrength, #selector(setWindStrength(_:)))
         add("창 흔들어 눈 털기 (Shake off snow)", #selector(toggleShake), on: s.shakeOn)
+        choices("눈 털기 강도 (Shake strength)", ShakeStrength.allCases.map { $0.title }, s.shakeStrength.rawValue, #selector(setShakeStrength(_:)))
         add("녹기·고드름 (Melting & icicles)", #selector(toggleMelt), on: s.meltOn)
         choices("녹는 속도 (Melt speed)", ["느리게 (Slow)", "보통 (Normal)", "빠르게 (Fast)"], s.meltSpeed, #selector(setMeltSpeed(_:)))
         choices("배터리 절약 (Battery saving)", BatteryMode.allCases.map { $0.title }, s.batteryMode.rawValue, #selector(setBatteryMode(_:)))
@@ -2418,6 +2438,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleWind() { Settings.shared.windOn.toggle(); engine.updateWindMonitor() }
     @objc func setWindStrength(_ i: NSMenuItem) { Settings.shared.windStrength = i.tag }
     @objc func toggleShake() { Settings.shared.shakeOn.toggle() }
+    @objc func setShakeStrength(_ i: NSMenuItem) { Settings.shared.shakeStrength = ShakeStrength(rawValue: i.tag) ?? .normal }
     @objc func toggleMelt() { Settings.shared.meltOn.toggle(); engine.applySettings() }
     @objc func setMeltSpeed(_ i: NSMenuItem) { Settings.shared.meltSpeed = i.tag; engine.lastMelt = engine.clock() }
     @objc func setBatteryMode(_ i: NSMenuItem) { Settings.shared.batteryMode = BatteryMode(rawValue: i.tag) ?? .auto; engine.updatePower() }

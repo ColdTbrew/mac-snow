@@ -29,7 +29,7 @@ enum Showcase {
 
     static func run(outDir: String) {
         // fixed settings for the run only (argument domain: never written to disk)
-        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 2],
+        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 2, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue],
                                                 forName: UserDefaults.argumentDomain)
         S = 1.15
         dockRect = CGRect(x: 455, y: 6, width: 530, height: 64)
