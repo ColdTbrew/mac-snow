@@ -195,7 +195,7 @@ enum Showcase {
             step(30, record: true) { _ in engine.meltStep(seconds: 20) }
             still("still-9-icicles")
             still("icicles-zoom", scale: 3, crop: CGRect(x: surf.minX + 10, y: surf.top - 30, width: 380, height: 70))
-            let ic = engine.piles[2]?.icicles.filter { $0 > 0 } ?? []
+            let ic = engine.piles[2]?.icicles.map(\.length).filter { $0 > 0 } ?? []
             print("melt mean \(before) -> \(engine.piles[2]?.mean ?? 0), icicles n=\(ic.count) max=\(ic.max() ?? 0)")
         }
         // 12) grab Music by its title bar and shake it: the snow and its snowman fly off.
@@ -220,6 +220,19 @@ enum Showcase {
             engine.mouseUp(at: grab)
             step(30 * 2, record: true)
             print("shake mean \(before) -> \(engine.piles[2]?.mean ?? 0), props on Music: \(engine.props.filter { $0.host == 2 }.count)")
+        }
+        // Clicking a visible snowman removes it and starts a puff at its position.
+        if let surf = engine.surfaces[2] {
+            engine.spawnSnowman(onSurface: surf.key, atX: surf.minX + surf.width * 0.8, fromY: surf.top + 30 * S)
+            if let snowman = engine.props.last {
+                step(30)
+                let click = CGPoint(x: snowman.pos.x, y: snowman.pos.y + snowman.height * 0.35)
+                let before = engine.spills.count
+                engine.mouseDown(at: click)
+                engine.mouseUp(at: click)
+                precondition(!engine.props.contains { $0 === snowman } && engine.spills.count == before + 26)
+                print("snowman click: removed, 26 puff particles")
+            }
         }
         print("showcase: \(frameNo) frames -> \(outDir)")
     }
