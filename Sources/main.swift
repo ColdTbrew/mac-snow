@@ -4,6 +4,7 @@ import QuartzCore
 import ApplicationServices
 import IOKit.ps
 import ServiceManagement
+import Sparkle
 
 /// Size scale so things read like the reel on large displays (1.0 on a ~900pt-tall screen).
 var S: CGFloat = {
@@ -2912,12 +2913,61 @@ final class Engine {
     }
 }
 
+// MARK: - Auto-update (Sparkle 2)
+
+@MainActor
+final class Updater {
+    static let releasesURL = URL(string: "https://github.com/ColdTbrew/mac-snow/releases/latest")!
+    let isConfigured: Bool
+    private let controller: SPUStandardUpdaterController
+
+    init() {
+        let key = (Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        isConfigured = !key.isEmpty
+        controller = SPUStandardUpdaterController(
+            startingUpdater: isConfigured,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+    }
+
+    var canCheckForUpdates: Bool {
+        isConfigured ? controller.updater.canCheckForUpdates : true
+    }
+
+    var automaticallyChecksForUpdates: Bool {
+        get { isConfigured ? controller.updater.automaticallyChecksForUpdates : false }
+        set {
+            guard isConfigured else { return }
+            controller.updater.automaticallyChecksForUpdates = newValue
+        }
+    }
+
+    func checkForUpdates() {
+        NSApp.activate(ignoringOtherApps: true)
+        guard isConfigured else {
+            let alert = NSAlert()
+            alert.messageText = "자동 업데이트가 설정되지 않았어요 (Updates not configured)"
+            alert.informativeText = "이 빌드에는 Sparkle 공개 키(SUPublicEDKey)가 들어 있지 않아 자동 업데이트를 확인할 수 없어요. GitHub Releases에서 새 버전을 직접 받을 수 있어요."
+            alert.addButton(withTitle: "GitHub Releases 열기")
+            alert.addButton(withTitle: "닫기")
+            if alert.runModal() == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(Self.releasesURL)
+            }
+            return
+        }
+        controller.checkForUpdates(nil)
+    }
+}
+
 // MARK: - App / menu bar
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let engine = Engine()
     var item: NSStatusItem!
     let menu = NSMenu()
+    var updater: Updater?
 
     var termSource: DispatchSourceSignal?
     func applicationWillTerminate(_ n: Notification) { engine.saveState() }
@@ -2936,6 +2986,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.delegate = self
         item.menu = menu
+        updater = Updater()
         engine.start()
         askDockAccessOncePerBuild()
         if ProcessInfo.processInfo.arguments.contains("--demo") {
@@ -2947,9 +2998,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         let s = Settings.shared
         menu.removeAllItems()
-        func add(_ title: String, _ sel: Selector, on: Bool? = nil, key: String = "") {
-            let i = NSMenuItem(title: title, action: sel, keyEquivalent: key)
-            i.target = self
+        func add(_ title: String, _ sel: Selector, on: Bool? = nil, key: String = "", enabled: Bool = true) {
+            let i = NSMenuItem(title: title, action: enabled ? sel : nil, keyEquivalent: key)
+            i.target = enabled ? self : nil
             if let on { i.state = on ? .on : .off }
             menu.addItem(i)
         }
@@ -2991,6 +3042,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("지금 Dock 제설 (Plow the Dock now)", #selector(plowNow))
         add("앞 창에 눈사람 놓기 (Debug)", #selector(debugSpawn))
         add("눈 치우기 (Clear snow)", #selector(clearSnow))
+        menu.addItem(.separator())
+        add("업데이트 확인… (Check for Updates…)", #selector(checkForUpdates), enabled: updater?.canCheckForUpdates ?? false)
+        add("자동 업데이트 확인 (Check for updates automatically)", #selector(toggleAutoUpdates), on: updater?.automaticallyChecksForUpdates ?? false, enabled: updater?.isConfigured ?? false)
         menu.addItem(.separator())
         add("종료 (Quit)", #selector(quit), key: "q")
     }
@@ -3037,6 +3091,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func plowNow() { engine.startPlow() }
     @objc func debugSpawn() { engine.spawnDemoSnowmen() }
     @objc func clearSnow() { engine.clearSnow() }
+    @MainActor @objc func checkForUpdates() { updater?.checkForUpdates() }
+    @MainActor @objc func toggleAutoUpdates() { updater?.automaticallyChecksForUpdates.toggle() }
     @objc func quit() { NSApp.terminate(nil) }
 }
 

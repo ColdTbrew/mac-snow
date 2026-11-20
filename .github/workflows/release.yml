@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 빌드·패키징
+        env:
+          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then VER="${GITHUB_REF_NAME#v}"; else VER="0.0.0-ci"; fi
           ./tools/release.sh "$VER" "${{ github.run_number }}"
@@ -33,4 +36,8 @@ jobs:
           if gh release view "$TAG" --json assets -q '.assets[].name' | grep -q '\.dmg$'; then
             echo "이미 DMG가 있어서 올리지 않아요"; exit 0
           fi
-          gh release upload "$TAG" dist/*.dmg dist/*.zip dist/SHA256SUMS.txt
+          ASSETS=(dist/*.dmg dist/*.zip dist/SHA256SUMS.txt)
+          if [ -f dist/appcast.xml ]; then
+            ASSETS+=(dist/appcast.xml)
+          fi
+          gh release upload "$TAG" "${ASSETS[@]}"
