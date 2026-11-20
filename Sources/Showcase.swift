@@ -46,7 +46,10 @@ enum Showcase {
         let ov = Overlay(virtualFrame: CGRect(origin: .zero, size: size))
         engine.overlays = [ov]
         engine.windowSource = fake
-        engine.dockSource = { _ in (dockRect.minX + 10, dockRect.maxX - 10, dockRect.maxY) }
+        engine.dockSource = { _ in
+            let inset = max(18, min(28, dockRect.height * 0.28))
+            return (dockRect.minX + inset, dockRect.maxX - inset, dockRect.maxY)
+        }
         engine.lowPower = false
         engine.forceFast = true            // re-read (fake) window geometry every step
         var t: CFTimeInterval = 0
@@ -88,6 +91,16 @@ enum Showcase {
         still("still-1-snow")
         still("pile-end-zoom", scale: 3, crop: CGRect(x: 80, y: 610, width: 260, height: 80))
         still("pile-occlusion-zoom", scale: 3, crop: CGRect(x: 600, y: 610, width: 200, height: 120))
+        if let dock = engine.surfaces[Engine.dockKey(0)], let pile = engine.piles[dock.key],
+           let gp = engine.pilePath(dock, pile) {
+            let box = gp.boundingBoxOfPath
+            precondition(dock.minX >= dockRect.minX + 18 && dock.maxX <= dockRect.maxX - 18)
+            precondition(box.minX >= dock.minX - 0.5 && box.maxX <= dock.maxX + 0.5 && box.minY >= dock.top - 2.0)
+        }
+        if let win = engine.surfaces[1], let pile = engine.piles[1],
+           let gp = engine.pilePath(win, pile) {
+            precondition(gp.boundingBoxOfPath.minY < win.top - 6)
+        }
         // 3) roll a snowball along Finder's snow, release -> snowman
         engine.demoBoost = 1
         let finder = fake.list[fake.index(1)].frame
@@ -165,6 +178,8 @@ enum Showcase {
             }
             engine.mouseUp(at: end)
             step(15, record: true)
+            precondition(!engine.props.contains(where: { $0 === base || $0 === small }) &&
+                             engine.props.contains(where: { $0.kind == .snowman && $0.host == s.key }))
             still("still-6-stacked")
         }
         // 10) quick sweeps push falling snow and lift dust off Music's pile.
@@ -192,11 +207,46 @@ enum Showcase {
             engine.piles[2]?.fill()
             engine.piles[2]?.created = .distantPast
             let before = engine.piles[2]?.mean ?? 0
-            step(30, record: true) { _ in engine.meltStep(seconds: 20) }
+            var sawDrip = false
+            step(30, record: true) { _ in
+                engine.meltStep(seconds: 20)
+                if engine.waterDrops.contains(where: { $0.kind == .drop }) { sawDrip = true }
+            }
+            precondition(sawDrip, "melting should produce dripping water drops")
             still("still-9-icicles")
             still("icicles-zoom", scale: 3, crop: CGRect(x: surf.minX + 10, y: surf.top - 30, width: 380, height: 70))
             let ic = engine.piles[2]?.icicles.map(\.length).filter { $0 > 0 } ?? []
             print("melt mean \(before) -> \(engine.piles[2]?.mean ?? 0), icicles n=\(ic.count) max=\(ic.max() ?? 0)")
+            if let pile = engine.piles[2] {
+                let targets = pile.icicles.indices.filter {
+                    pile.icicles[$0].length >= 4 * S &&
+                    pile.icicles[$0].x < surf.width - 12 * S &&
+                    engine.isVisible(surf.key, surf.minX + pile.icicles[$0].x)
+                }
+                precondition(targets.count >= 2, "expected at least 2 visible icicles to test click and swipe")
+                // Clicking an icicle snaps it and spawns an .iceShard without spawning a snowman.
+                let idx1 = targets[0], site1 = pile.icicles[idx1]
+                let half1 = min(2.2 * S, site1.length * 0.18) * site1.girth
+                let clickPt = CGPoint(x: surf.minX + site1.x + half1 * site1.lean * 0.5, y: surf.top - site1.length * 0.5)
+                let shardsBeforeClick = engine.waterDrops.filter { $0.kind == .iceShard }.count
+                let propsBeforeClick = engine.props.count
+                engine.mouseDown(at: clickPt)
+                engine.mouseUp(at: clickPt)
+                precondition(pile.icicles[idx1].length == 0, "clicking an icicle should snap it (length == 0)")
+                precondition(engine.waterDrops.filter { $0.kind == .iceShard }.count == shardsBeforeClick + 1, "clicking an icicle should spawn an .iceShard")
+                precondition(engine.props.count == propsBeforeClick, "clicking an icicle should not spawn a snowman")
+                // Swiping quickly across a visible icicle snaps it.
+                let idx2 = targets[1], site2 = pile.icicles[idx2]
+                let gx2 = surf.minX + site2.x, y2 = surf.top - site2.length * 0.5
+                let shardsBeforeSwipe = engine.waterDrops.filter { $0.kind == .iceShard }.count
+                engine.mouseWind(at: CGPoint(x: gx2 - 25 * S, y: y2))
+                step(1)
+                engine.mouseWind(at: CGPoint(x: gx2 + 25 * S, y: y2))
+                precondition(pile.icicles[idx2].length == 0, "swiping across an icicle should snap it (length == 0)")
+                precondition(engine.waterDrops.filter { $0.kind == .iceShard }.count >= shardsBeforeSwipe + 1, "swiping an icicle should spawn an .iceShard")
+                step(15, record: true)
+                print("icicle interact: click snapped idx=\(idx1), swipe snapped idx=\(idx2), waterDrops=\(engine.waterDrops.count)")
+            }
         }
         // 12) grab Music by its title bar and shake it: the snow and its snowman fly off.
         let mi = fake.index(2)
@@ -249,7 +299,43 @@ enum Showcase {
             still("snowmen-styles-zoom", scale: 2, crop: CGRect(x: surf.minX + 20, y: surf.top - 10, width: 320, height: 90))
             print("snowman styles: \(styles.count) hat variants rendered")
 
-            // 13) Campfire cursor mode: hover over Music's snow to melt a trough into flowing water droplets.
+            // 13) throw a snowball fast at a snowman: parabolic arc, hit removes snowman + puff.
+            step(25)
+            let target = Prop(kind: .snowman, scale: S, withBalls: false)
+            target.grounded = true
+            engine.addProp(target, on: surf.key, atX: surf.minX + 500, fromY: surf.top)
+            let ammo = Prop(kind: .ball, scale: 6 * S)
+            ammo.grounded = true
+            engine.addProp(ammo, on: surf.key, atX: surf.minX + 340, fromY: surf.top)
+            step(5)
+            let throwStart = CGPoint(x: ammo.pos.x, y: ammo.pos.y + ammo.scale)
+            let throwRelease = CGPoint(x: throwStart.x + 90, y: throwStart.y + 35)
+            engine.mouseDown(at: throwStart)
+            step(5) { i in
+                let k = CGFloat(i + 1) / 5
+                engine.mouseDragged(to: CGPoint(x: throwStart.x + (throwRelease.x - throwStart.x) * k,
+                                                y: throwStart.y + (throwRelease.y - throwStart.y) * k))
+            }
+            engine.mouseUp(at: throwRelease)
+            engine.forceFast = false
+            precondition(ammo.thrown && !ammo.grounded && engine.desiredInterval() == 1.0 / 30)
+            engine.forceFast = true
+            var hitVerified = false
+            for i in 0..<25 {
+                let spillsBefore = engine.spills.count
+                step(1)
+                if i == 1 { still("still-11-throw") }
+                if !hitVerified && !engine.props.contains(where: { $0 === target }) {
+                    precondition(!engine.props.contains(where: { $0 === ammo }))
+                    precondition(engine.spills.count >= spillsBefore + 38)
+                    hitVerified = true
+                    still("still-11-throw-hit")
+                }
+            }
+            precondition(hitVerified)
+            print("snowball throw: hit snowman, removed with puff particles")
+
+            // 14) Campfire cursor mode: hover over Music's snow to melt a trough into flowing water droplets.
             engine.piles[2]?.fill()
             engine.pileDirty = true
             step(2)
