@@ -233,6 +233,21 @@ enum Showcase {
                 precondition(!engine.props.contains { $0 === snowman } && engine.spills.count == before + 26)
                 print("snowman click: removed, 26 puff particles")
             }
+            // Render all 4 snowman hat styles side by side to verify accessory variants.
+            let styles: [SnowmanStyle] = [
+                SnowmanStyle(hat: .santa, scarf: .red),
+                SnowmanStyle(hat: .beanie, scarf: .pine),
+                SnowmanStyle(hat: .bucket, scarf: .cobalt),
+                SnowmanStyle(hat: .tophat, scarf: .gold),
+            ]
+            for (idx, style) in styles.enumerated() {
+                let m = Prop(kind: .snowman, scale: S, withBalls: idx == 0, style: style)
+                m.grounded = true
+                engine.addProp(m, on: surf.key, atX: surf.minX + 60 + CGFloat(idx) * 70, fromY: surf.top)
+            }
+            step(10)
+            still("snowmen-styles-zoom", scale: 2, crop: CGRect(x: surf.minX + 20, y: surf.top - 10, width: 320, height: 90))
+            print("snowman styles: \(styles.count) hat variants rendered")
         }
         print("showcase: \(frameNo) frames -> \(outDir)")
     }
