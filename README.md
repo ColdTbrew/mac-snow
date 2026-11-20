@@ -7,8 +7,8 @@
 맥 화면에 눈이 내리고, 창 윗면과 Dock 위에 눈이 소복이 쌓이는 메뉴바 앱이에요.
 인스타그램 릴스에서 본 크리스마스 데스크톱 효과를 보고 처음부터 새로 만들었어요(원본 영상의 이미지·에셋은 쓰지 않았어요).
 
-- Swift + AppKit + Core Animation, 외부 라이브러리 없음
-- Xcode 없이 Command Line Tools만으로 빌드
+- Swift + AppKit + Core Animation (+ [Sparkle 2](https://sparkle-project.org/) 자동 업데이트)
+- Xcode 없이 Command Line Tools만으로 빌드 (`tools/fetch_sparkle.sh`가 Sparkle 2 바이너리를 자동 다운로드·검증)
 - 앱 아이콘 원본은 `Resources/AppIcon.svg`, `Resources/AppIcon.icns`는 `tools/make_icns.py`로 만들어요
 - Dock 아이콘 없이 메뉴바 ❄ 아이콘으로만 동작
 
@@ -43,6 +43,7 @@
 - **녹기·고드름**: 쌓인 지 3분이 지난 눈은 천천히 녹아요. 녹은 물로 창 윗변 아래에 길이가 다른 고드름이 하나씩 또는 몇 개씩 모여 맺히고, 눈이 다 녹으면 고드름도 줄어들어요. 메뉴에서 켜고 끄거나 녹는 속도(느리게·보통·빠르게, 분당 약 0.4·1.2·3pt)를 고를 수 있어요.
 - **배터리 절약**: 자동으로 두면 전원 어댑터가 빠져 있거나 저전력 모드일 때 눈 양과 갱신 횟수를 줄여요(폭설은 '많이'로 낮춰요). 항상 켜 두거나 끌 수도 있어요.
 - **로그인 시 자동 실행**: 메뉴에서 켜면 로그인할 때 MacSnow가 자동으로 실행돼요(`SMAppService`).
+- **자동 업데이트**: [Sparkle 2](https://sparkle-project.org/)로 GitHub Releases의 새 버전을 확인하고 바로 업데이트할 수 있어요. 메뉴바 ❄ > **업데이트 확인…**으로 수동 확인하거나 **자동 업데이트 확인**을 켜고 끌 수 있어요. (로컬 개발 빌드처럼 EdDSA 공개 키가 없는 빌드에서는 자동 확인이 비활성화돼요.)
 - **제설차**: 노란 픽셀 제설차가 가끔 Dock 위를 지나가며 눈을 밀어요. 밀린 눈은 날 앞에 쐐기 모양으로 모여 같이 움직여요. 메뉴에서 바로 부를 수도 있어요.
 
 ## 스크린샷
@@ -92,7 +93,7 @@ open /Applications/MacSnow.app
 - **화면 기록 권한은 필요 없어요.** 창 위치(크기·좌표)만 읽고, 창 제목이나 내용은 읽지 않아요.
 - **손쉬운 사용 권한은 선택 사항이에요.** Dock의 실제 프레임(위치·크기)만 읽는 데 사용해요. 권한이 없으면 새 빌드를 처음 실행할 때 한 번 시스템 권한 요청 창을 띄워요(거절해도 다시 묻지 않아요). 나중에 메뉴바 ❄ > **Dock 크기 정확히 맞추기 (손쉬운 사용 권한)**에서 다시 요청할 수 있어요. 권한이 없어도 추정 크기로 동작해요. 애드혹 서명으로 다시 빌드하면 권한을 다시 허용해야 할 수 있어요.
 - 클릭·드래그는 전역 마우스 이벤트 모니터로 감지해요. 마우스 이벤트는 보통 추가 권한 없이 동작해요. 혹시 제목줄 클릭이나 눈 굴리기에 반응이 없으면 시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 MacSnow를 허용해 보세요.
-- 네트워크 연결은 하지 않아요.
+- **네트워크 연결은 업데이트 확인에만 써요.** Sparkle 2가 GitHub Releases의 `appcast.xml`을 확인하고 새 버전을 내려받는 데만 사용하며, 다른 데이터나 분석 정보는 보내지 않아요. 메뉴바 ❄ > **자동 업데이트 확인**을 끄면 자동 네트워크 요청도 하지 않아요.
 
 ## 메뉴바 ❄ 메뉴
 
@@ -115,6 +116,8 @@ open /Applications/MacSnow.app
 | 지금 Dock 제설 | 제설차 바로 부르기 |
 | 앞 창에 눈사람 놓기 | 맨 앞 창들에 눈사람 바로 놓기 |
 | 눈 치우기 | 쌓인 눈과 눈사람 모두 지우기 |
+| 업데이트 확인… | Sparkle로 GitHub Releases 최신 버전 확인 |
+| 자동 업데이트 확인 | 주기적인 자동 업데이트 확인 켜기/끄기 (공개 키가 포함된 릴리스 빌드에서 활성화) |
 | 종료 | 앱 종료 |
 
 설정은 저장돼서 다음에 켜도 유지돼요. 로그인 시 자동 실행은 macOS 로그인 항목 설정을 그대로 따라요.
@@ -173,7 +176,22 @@ open /Applications/MacSnow.app
 
 - 앱 코드는 `Sources/main.swift`, 가상 화면 렌더러는 `Sources/Showcase.swift`예요.
 - `open build/MacSnow.app --args --demo`로 실행하면 처음 25초 동안 눈이 빨리 쌓여요(확인용).
-- 배포 파일 만들기: `./tools/release.sh 0.1.0` → `dist/MacSnow-0.1.0.dmg`, `.zip`, `SHA256SUMS.txt` (애드혹 서명). `v*` 태그를 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 맥에서 빌드해 릴리스에 올려요.
+- 배포 파일 만들기: `./tools/release.sh 0.5.0` → `dist/MacSnow-0.5.0.dmg`, `.zip`, `SHA256SUMS.txt` (애드혹 서명). `SPARKLE_PUBLIC_ED_KEY`가 있으면 번들 `Info.plist`의 `SUPublicEDKey`에 주입하고, `SPARKLE_PRIVATE_ED_KEY`가 있으면 `dist/MacSnow-0.5.0.zip`을 EdDSA 서명해 `dist/appcast.xml`을 함께 만들어요. `v*` 태그를 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 맥에서 빌드해 릴리스에 올려요.
+- **Sparkle 자동 업데이트 키 설정 (최초 1회)**:
+  1. `./tools/fetch_sparkle.sh` 실행 후 키 쌍을 생성해요.
+     ```
+     ./build/deps/sparkle/bin/generate_keys
+     ```
+     출력되는 `<string>...</string>` 값이 공개 키(`SPARKLE_PUBLIC_ED_KEY`)예요.
+  2. CI용 개인 키를 임시 파일로 내보낸 뒤 읽고 즉시 삭제해요.
+     ```
+     ./build/deps/sparkle/bin/generate_keys -x /tmp/sparkle_ed_key
+     cat /tmp/sparkle_ed_key && rm -f /tmp/sparkle_ed_key
+     ```
+  3. GitHub 저장소 **Settings > Secrets and variables > Actions**에 아래 두 시크릿을 등록해요.
+     - `SPARKLE_PUBLIC_ED_KEY`: 1단계의 공개 키 (`Info.plist`의 `SUPublicEDKey`로 자동 주입)
+     - `SPARKLE_PRIVATE_ED_KEY`: 2단계의 개인 키 (`dist/appcast.xml` EdDSA 서명에 사용)
+  시크릿이 설정되지 않은 로컬 빌드나 `workflow_dispatch`에서도 오류 없이 빌드되며, `appcast.xml` 생성만 건너뛰어요.
 - `tools/notify.sh`: 실행 중인 앱에 디버그 신호를 보내요.
   `plow`(제설차), `spawn`(눈사람), `jump`, `shake`(앞 창 눈 털기), `clear`, `fill`(눈 가득), `roll`(눈 굴리기 시연), `dump`(상태를 `$TMPDIR/macsnow-debug.txt`에 기록), `fast`(12초간 드래그 중인 것처럼 60Hz)
 - 스크린샷·데모 다시 만들기: 실제 화면은 캡처하지 않고 가상 화면에 시나리오(눈 쌓임 → 창 드래그 → 눈 굴리기 → 눈사람 점프 → 창 닫기 → 창 좁히기·눈 낙하 → Dock 폭 변경 → 제설차)를 돌려 PNG로 저장해요.
