@@ -90,6 +90,12 @@ open /Applications/MacSnow.app
 
 직접 빌드한 앱이라(애드혹 서명) 처음 열 때 경고가 뜨면 Finder에서 앱을 우클릭 → 열기를 눌러 주세요.
 
+## 원활한 조작 팁 (macOS 설정)
+
+눈사람 클릭·눈 굴리기·눈덩이 집어 던지기를 할 때 창 윗변 바깥(배경화면 영역)으로 클릭이 통과하면서 모든 창이 옆으로 밀린다면, macOS의 데스크탑 보기 설정을 아래처럼 바꿔 주세요.
+
+- **시스템 설정 > 데스크탑 및 Dock > 배경화면을 클릭하여 데스크탑 보기** → **스테이지 매니저에서만** (영문: *System Settings > Desktop & Dock > Click wallpaper to reveal desktop → Only in Stage Manager*)
+
 ## 권한
 
 - **화면 기록 권한은 필요 없어요.** 창 위치(크기·좌표)만 읽고, 창 제목이나 내용은 읽지 않아요.
