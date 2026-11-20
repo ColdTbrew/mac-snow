@@ -758,8 +758,9 @@ final class Prop {
     var localX: CGFloat = 0
     var pos = CGPoint.zero     // global, bottom centre
     var vy: CGFloat = 0
-    var vx: CGFloat = 0        // only while falling off (shaken / host gone)
+    var vx: CGFloat = 0        // while falling off (shaken / host gone) or thrown
     var grounded = false
+    var thrown = false
     let decoSide: CGFloat = Bool.random() ? 1 : -1
     weak var parent: CALayer?
 
@@ -826,6 +827,8 @@ final class Carry {
     let offset: CGSize
     var lastPoint: CGPoint
     var lastTime: CFTimeInterval
+    var vx: CGFloat = 0
+    var vy: CGFloat = 0
     var active = false
     var cancelled = false
     init(prop: Prop, host: UInt64, at p: CGPoint, time: CFTimeInterval) {
@@ -1905,9 +1908,15 @@ final class Engine {
            drag?.confirmed == true || (!c.active && surfaces[c.host] == nil) { carryCancel() }
         guard !props.isEmpty else { return }
         let gravity: CGFloat = 1400 * S
+        let throwGravity: CGFloat = 1100 * S
         let lowest = (overlays.map { $0.frame.minY }.min() ?? 0) - 120
-        props.removeAll { m in
-            if let c = carry, c.active, c.prop === m { place(m); return false }
+        let minX = (overlays.map { $0.frame.minX }.min() ?? 0) - 120
+        let maxX = (overlays.map { $0.frame.maxX }.max() ?? 0) + 120
+        var dead = Set<ObjectIdentifier>()
+
+        for m in props where !(m.host == nil && m.thrown) {
+            let mid = ObjectIdentifier(m)
+            if let c = carry, c.active, c.prop === m { place(m); continue }
             if let k = m.host, let s = surfaces[k] {
                 m.pos.x = s.minX + m.localX
                 let ground = groundY(m, k, s)
@@ -1921,7 +1930,7 @@ final class Engine {
             } else if let k = m.host, hostAlive(k) {
                 // its window is only out of the list for now (other Space, minimized, hidden): wait for it
                 m.layer.isHidden = true; m.deco?.isHidden = true
-                return false
+                continue
             } else {
                 // the window it sat on is gone: fall straight down; poof on the Dock, else off screen
                 m.host = nil; m.grounded = false
@@ -1932,13 +1941,87 @@ final class Engine {
                 m.vx *= 1 - min(1, 0.6 * dt)
                 if let d = orderedSurfaces.first(where: { $0.z < 0 && m.pos.x >= $0.minX && m.pos.x <= $0.maxX }) {
                     let g = d.top + (piles[d.key]?.height(at: m.pos.x - d.minX) ?? 0) * 0.5
-                    if oldY >= g && m.pos.y <= g { m.pos.y = g; poof(m, on: d); return true }
+                    if oldY >= g && m.pos.y <= g { m.pos.y = g; poof(m, on: d); dead.insert(mid); continue }
                 }
-                if m.pos.y < lowest { m.remove(); return true }
+                if m.pos.y < lowest { m.remove(); dead.insert(mid); continue }
             }
             place(m)
-            return false
         }
+
+        func hitRect(_ p: CGPoint, radius: CGFloat, _ t: Prop) -> Bool {
+            let x = min(max(p.x, t.pos.x - t.halfWidth), t.pos.x + t.halfWidth)
+            let y = min(max(p.y, t.pos.y), t.pos.y + t.height)
+            return hypot(p.x - x, p.y - y) < radius
+        }
+
+        var hitSnowman = false
+        for m in props where m.host == nil && m.thrown {
+            let mid = ObjectIdentifier(m)
+            if dead.contains(mid) { continue }
+            if dt <= 0 { place(m); continue }
+            let oldPos = m.pos
+            m.vy -= throwGravity * dt
+            m.vx *= 1 - min(1, 0.35 * dt)
+            m.pos.x += m.vx * dt
+            m.pos.y += m.vy * dt
+
+            let oldCenter = CGPoint(x: oldPos.x, y: oldPos.y + m.scale)
+            let newCenter = CGPoint(x: m.pos.x, y: m.pos.y + m.scale)
+            let travel = hypot(newCenter.x - oldCenter.x, newCenter.y - oldCenter.y)
+            let steps = max(1, Int(ceil(travel / max(4, m.scale))))
+            var collided = false
+
+            for stepIndex in 1...steps where !collided {
+                let u = CGFloat(stepIndex) / CGFloat(steps)
+                let probe = CGPoint(x: oldCenter.x + (newCenter.x - oldCenter.x) * u,
+                                    y: oldCenter.y + (newCenter.y - oldCenter.y) * u)
+                if let t = props.reversed().first(where: { t in
+                    t.kind == .snowman && !t.layer.isHidden && !dead.contains(ObjectIdentifier(t)) &&
+                        hitRect(probe, radius: m.scale + 2 * S, t)
+                }) {
+                    dead.insert(mid)
+                    dead.insert(ObjectIdentifier(t))
+                    m.pos = CGPoint(x: probe.x, y: probe.y - m.scale)
+                    m.remove(); t.remove()
+                    if let tk = t.host, let pile = piles[tk] {
+                        let lx = surfaces[tk].map { t.pos.x - $0.minX } ?? t.localX
+                        pile.deposit(at: lx, area: 0.25 * (13 * t.scale) * (50 * t.scale))
+                        pileDirty = true
+                    }
+                    snowPuff(for: t, baseY: t.pos.y, source: t.host ?? 0)
+                    snowPuff(for: m, baseY: m.pos.y, source: t.host ?? 0)
+                    hitSnowman = true
+                    collided = true
+                } else if let t = props.reversed().first(where: { t in
+                    t.kind == .ball && t !== m && !t.layer.isHidden && !dead.contains(ObjectIdentifier(t)) &&
+                        hypot(probe.x - t.pos.x, probe.y - (t.pos.y + t.scale)) < m.scale + t.scale + 2 * S
+                }) {
+                    dead.insert(mid)
+                    m.pos = CGPoint(x: probe.x, y: probe.y - m.scale)
+                    m.remove()
+                    snowPuff(for: m, baseY: m.pos.y, source: t.host ?? 0)
+                    jump(t)
+                    collided = true
+                }
+            }
+            if collided { continue }
+
+            if m.vy <= 0, let s = landingSurface(at: m.pos.x, below: oldPos.y, above: m.pos.y) {
+                dead.insert(mid)
+                m.pos.y = s.top
+                poof(m, on: s)
+                continue
+            }
+            if m.pos.y < lowest || (!overlays.isEmpty && (m.pos.x < minX || m.pos.x > maxX)) {
+                dead.insert(mid)
+                m.remove()
+                continue
+            }
+            place(m)
+        }
+
+        if !dead.isEmpty { props.removeAll { dead.contains(ObjectIdentifier($0)) } }
+        if hitSnowman { saveState() }
     }
 
     /// Surface owner still around? Dock keys always; windows: asked at most every 2 s per key.
@@ -2006,7 +2089,8 @@ final class Engine {
         guard let c = carry, !c.cancelled else { return }
         c.cancelled = true; c.active = false
         let m = c.prop
-        m.host = c.host; m.localX = c.localX; m.pos = c.pickup; m.grounded = true; m.vy = 0
+        m.host = c.host; m.localX = c.localX; m.pos = c.pickup; m.grounded = true; m.thrown = false; m.vx = 0; m.vy = 0
+        m.layer.removeAnimation(forKey: "spin")
         if let s = surfaces[c.host] { m.pos = CGPoint(x: s.minX + c.localX, y: groundY(m, c.host, s)) }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         place(m)
@@ -2022,8 +2106,16 @@ final class Engine {
         if !c.active {
             guard hypot(p.x - c.down.x, p.y - c.down.y) > 4 else { return }
             c.active = true
-            c.prop.host = nil; c.prop.grounded = false; c.prop.vy = 0
+            c.prop.host = nil; c.prop.grounded = false; c.prop.thrown = false; c.prop.vx = 0; c.prop.vy = 0
             c.prop.layer.removeAnimation(forKey: "squash")
+        }
+        if elapsed > 0.12 {
+            c.vx = 0; c.vy = 0
+        } else if elapsed > 0.002 {
+            let rvx = dx / CGFloat(elapsed), rvy = dy / CGFloat(elapsed)
+            let alpha = min(CGFloat(1), CGFloat(elapsed) / 0.045)
+            c.vx += (rvx - c.vx) * alpha
+            c.vy += (rvy - c.vy) * alpha
         }
         var prediction = CGSize.zero
         if elapsed > 0 && elapsed < 0.15 {
@@ -2048,6 +2140,23 @@ final class Engine {
         guard let c = carry, c.active, !c.cancelled else { return }
         let m = c.prop
         m.pos = c.position(at: p)       // release uses the actual grab point, without prediction
+        if clock() - c.lastTime > 0.12 { c.vx = 0; c.vy = 0 }
+        let speed = hypot(c.vx, c.vy)
+        if speed > 260 * S {
+            m.host = nil
+            m.grounded = false
+            m.thrown = true
+            m.vx = max(-1100 * S, min(1100 * S, c.vx * 0.85))
+            m.vy = max(-600 * S, min(950 * S, c.vy * 0.85))
+            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+            spin.byValue = (m.vx >= 0 ? -1 : 1) * CGFloat.random(in: 4...8)
+            spin.duration = 0.9
+            spin.isAdditive = true
+            spin.repeatCount = .infinity
+            m.layer.add(spin, forKey: "spin")
+            place(m)
+            return
+        }
         let center = CGPoint(x: m.pos.x, y: m.pos.y + m.scale)
         let targets = props.reversed().filter { $0 !== m && !$0.layer.isHidden }
         if Settings.shared.snowmenOn, let target = targets.first(where: { t in
@@ -2075,7 +2184,7 @@ final class Engine {
         let surface = landingSurface(at: m.pos.x, below: m.pos.y, above: -CGFloat.greatestFiniteMagnitude)
         m.host = surface?.key
         m.localX = surface.map { m.pos.x - $0.minX } ?? 0
-        m.grounded = false; m.vy = 0
+        m.grounded = false; m.thrown = false; m.vx = 0; m.vy = 0
         place(m)
     }
 

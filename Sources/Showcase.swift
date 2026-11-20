@@ -178,6 +178,8 @@ enum Showcase {
             }
             engine.mouseUp(at: end)
             step(15, record: true)
+            precondition(!engine.props.contains(where: { $0 === base || $0 === small }) &&
+                             engine.props.contains(where: { $0.kind == .snowman && $0.host == s.key }))
             still("still-6-stacked")
         }
         // 10) quick sweeps push falling snow and lift dust off Music's pile.
@@ -261,6 +263,42 @@ enum Showcase {
             step(10)
             still("snowmen-styles-zoom", scale: 2, crop: CGRect(x: surf.minX + 20, y: surf.top - 10, width: 320, height: 90))
             print("snowman styles: \(styles.count) hat variants rendered")
+
+            // 13) throw a snowball fast at a snowman: parabolic arc, hit removes snowman + puff.
+            step(25)
+            let target = Prop(kind: .snowman, scale: S, withBalls: false)
+            target.grounded = true
+            engine.addProp(target, on: surf.key, atX: surf.minX + 500, fromY: surf.top)
+            let ammo = Prop(kind: .ball, scale: 6 * S)
+            ammo.grounded = true
+            engine.addProp(ammo, on: surf.key, atX: surf.minX + 340, fromY: surf.top)
+            step(5)
+            let throwStart = CGPoint(x: ammo.pos.x, y: ammo.pos.y + ammo.scale)
+            let throwRelease = CGPoint(x: throwStart.x + 90, y: throwStart.y + 35)
+            engine.mouseDown(at: throwStart)
+            step(5) { i in
+                let k = CGFloat(i + 1) / 5
+                engine.mouseDragged(to: CGPoint(x: throwStart.x + (throwRelease.x - throwStart.x) * k,
+                                                y: throwStart.y + (throwRelease.y - throwStart.y) * k))
+            }
+            engine.mouseUp(at: throwRelease)
+            engine.forceFast = false
+            precondition(ammo.thrown && !ammo.grounded && engine.desiredInterval() == 1.0 / 30)
+            engine.forceFast = true
+            var hitVerified = false
+            for i in 0..<25 {
+                let spillsBefore = engine.spills.count
+                step(1)
+                if i == 1 { still("still-11-throw") }
+                if !hitVerified && !engine.props.contains(where: { $0 === target }) {
+                    precondition(!engine.props.contains(where: { $0 === ammo }))
+                    precondition(engine.spills.count >= spillsBefore + 38)
+                    hitVerified = true
+                    still("still-11-throw-hit")
+                }
+            }
+            precondition(hitVerified)
+            print("snowball throw: hit snowman, removed with puff particles")
         }
         print("showcase: \(frameNo) frames -> \(outDir)")
     }
