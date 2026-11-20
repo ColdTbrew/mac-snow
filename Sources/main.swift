@@ -1069,6 +1069,7 @@ final class Prop {
 }
 
 final class Plow {
+    enum Phase { case pushing, dumping, leaving }
     let layer: CALayer
     let bladeH: CGFloat
     let mound = CAShapeLayer()
@@ -1076,6 +1077,9 @@ final class Plow {
     var x: CGFloat
     var lastFront: CGFloat
     var volume: CGFloat = 0
+    var phase: Phase = .pushing
+    var phaseTime: CGFloat = 0
+    var spillDebt: CGFloat = 0
     init(screenIndex: Int, x: CGFloat) {
         (layer, bladeH) = makePlowLayer(px: 1.8 * S)
         self.screenIndex = screenIndex; self.x = x
@@ -1738,8 +1742,8 @@ final class Engine {
         updatePlows(dt: dt, now: now)
         updateProps(dt: dt)
         updateRoll()
-        // pile paths: immediately when windows move, ~20 Hz while campfire melts, otherwise ~2.5 Hz
-        let pileInterval: CFTimeInterval = campfireMelting ? 0.05 : 0.4
+        // pile paths: immediately when windows move, ~20 Hz while campfire melts or plow pushes, otherwise ~2.5 Hz
+        let pileInterval: CFTimeInterval = (campfireMelting || !plows.isEmpty) ? 0.05 : 0.4
         if geometryChanged || (pileDirty && now - lastPileDraw > pileInterval) {   // moves: cheap re-position
             redrawPiles(); pileDirty = false; geometryChanged = false; lastPileDraw = now
         }
@@ -2891,15 +2895,56 @@ final class Engine {
     // MARK: plow
 
     func startPlow() {
+        CATransaction.begin(); CATransaction.setDisableActions(true)
         for (i, o) in overlays.enumerated() {
             guard plows.allSatisfy({ $0.screenIndex != i }), let s = surfaces[Engine.dockKey(i)] else { continue }
-            let p = Plow(screenIndex: i, x: s.minX - 60 * S)
+            let spillEdge = s.maxX + 6 * S
+            let p = Plow(screenIndex: i, x: s.minX)
+            let stopX = spillEdge - (p.layer.bounds.width / 2 - 2 * S)
+            let startX = min(s.minX - 16 * S, stopX - 10 * S)
+            p.x = startX
+            p.lastFront = s.minX
+            p.layer.opacity = 0
+            p.layer.position = o.local(CGPoint(x: startX, y: s.top - 1))
             o.actors.addSublayer(p.mound)
             o.actors.addSublayer(p.layer)
             plows.append(p)
         }
+        CATransaction.commit()
         lastPlow = clock()
         updateRate()
+    }
+
+    private func spawnPlowSpill(at edgeX: CGFloat, topY: CGFloat, moundH: CGFloat, area: CGFloat, source: UInt64, screenIndex: Int) {
+        guard spills.count < 160, overlays.indices.contains(screenIndex) else { return }
+        let o = overlays[screenIndex]
+        let layer = flakeLayer()
+        let r = min(4.8 * S, max(2.2 * S, (area / .pi).squareRoot())) * CGFloat.random(in: 0.75...1.25)
+        let pos = CGPoint(x: edgeX + CGFloat.random(in: -2...5) * S,
+                          y: topY + CGFloat.random(in: 0...max(3 * S, moundH * 0.85)))
+        layer.bounds = CGRect(x: 0, y: 0, width: 2 * r, height: 2 * r)
+        layer.cornerRadius = r
+        layer.position = o.local(pos)
+        o.actors.addSublayer(layer)
+        spills.append(Spill(layer: layer, pos: pos,
+                            vy: CGFloat.random(in: -25...65) * S,
+                            vx: CGFloat.random(in: 35...140) * S,
+                            area: area, source: source, fromDock: true))
+        if spills.count < 160, CGFloat.random(in: 0..<1) < 0.4 {
+            let sprayLayer = flakeLayer()
+            let sr = CGFloat.random(in: 1.1...2.0) * S
+            let sprayPos = CGPoint(x: edgeX + CGFloat.random(in: -1...6) * S,
+                                   y: topY + CGFloat.random(in: 2 * S...max(5 * S, moundH)))
+            sprayLayer.bounds = CGRect(x: 0, y: 0, width: 2 * sr, height: 2 * sr)
+            sprayLayer.cornerRadius = sr
+            sprayLayer.position = o.local(sprayPos)
+            o.actors.addSublayer(sprayLayer)
+            spills.append(Spill(layer: sprayLayer, pos: sprayPos,
+                                vy: CGFloat.random(in: 20...95) * S,
+                                vx: CGFloat.random(in: 20...90) * S,
+                                area: 0, source: source, fromDock: true,
+                                ttl: CGFloat.random(in: 0.35...0.55)))
+        }
     }
 
     func updatePlows(dt: CGFloat, now: CFTimeInterval) {
@@ -2912,36 +2957,124 @@ final class Engine {
             guard p.screenIndex < overlays.count, let s = surfaces[Engine.dockKey(p.screenIndex)] else {
                 p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true
             }
-            p.x += 90 * S.squareRoot() * dt
-            // scrape everything the blade passed over into the mound in front of it
-            let f = p.front
-            if f > p.lastFront, let pile = piles[s.key] {
-                p.volume += pile.take(from: p.lastFront - s.minX, to: f - s.minX, fraction: 1)
-                p.volume = min(p.volume, 1.6 * p.bladeH * p.bladeH)   // the rest spills off the front
-                pileDirty = true
-            }
-            p.lastFront = f
             let o = overlays[p.screenIndex]
+            let spillEdge = s.maxX + 6 * S
+            let stopX = spillEdge - (p.layer.bounds.width / 2 - 2 * S)
+            let speed = 90 * S.squareRoot()
+
+            switch p.phase {
+            case .pushing:
+                p.phaseTime += dt
+                p.x += speed * dt
+                p.layer.opacity = Float(min(1, p.phaseTime / 0.30))
+                if p.x >= stopX {
+                    p.x = stopX
+                    p.phase = .dumping
+                    p.phaseTime = 0
+                    p.layer.opacity = 1
+                }
+                let f = p.front
+                if f > p.lastFront, let pile = piles[s.key] {
+                    p.volume += pile.take(from: p.lastFront - s.minX, to: f - s.minX, fraction: 1)
+                    p.volume = min(p.volume, 1.6 * p.bladeH * p.bladeH)   // the rest spills off the front
+                    pileDirty = true
+                }
+                p.lastFront = f
+
+            case .dumping:
+                p.x = stopX
+                p.layer.opacity = 1
+                p.phaseTime += dt
+                if p.volume <= 4 {
+                    p.spillDebt += p.volume
+                    p.volume = 0
+                }
+                if (p.volume <= 0.5 && p.phaseTime >= 0.30) || p.phaseTime >= 0.85 {
+                    if p.spillDebt >= 3 * S * S {
+                        spawnPlowSpill(at: spillEdge, topY: s.top, moundH: 0, area: p.spillDebt, source: s.key, screenIndex: p.screenIndex)
+                    }
+                    p.volume = 0
+                    p.spillDebt = 0
+                    p.mound.path = nil
+                    p.mound.shadowPath = nil
+                    p.phase = .leaving
+                    p.phaseTime = 0
+                }
+
+            case .leaving:
+                let leaveDuration: CGFloat = 0.55
+                p.phaseTime += dt
+                p.x = max(s.minX, p.x - 32 * S.squareRoot() * dt)
+                p.layer.opacity = Float(max(0, 1 - p.phaseTime / leaveDuration))
+                p.mound.path = nil
+                p.mound.shadowPath = nil
+                p.layer.position = o.local(CGPoint(x: p.x, y: s.top - 1))
+                if p.phaseTime >= leaveDuration {
+                    p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true
+                }
+                return false
+            }
+
+            if p.phase == .leaving { return false }
+
+            let f = p.front
+            let avail = max(0, spillEdge - f)
+            let H = p.volume > 0 ? min((p.volume / 1.32).squareRoot(), p.bladeH * 1.05) : 0
+            let maxSupported: CGFloat
+            if p.phase == .dumping || avail <= 0.5 {
+                maxSupported = 0
+            } else {
+                let maxH = min(p.bladeH * 1.05, avail * 1.35)
+                maxSupported = 0.62 * maxH * avail
+            }
+            if p.volume > maxSupported {
+                let excess = p.volume - maxSupported
+                let drain = min(excess, max(excess * min(1, 10 * dt), 280 * S * S * dt))
+                p.volume = max(0, p.volume - drain)
+                p.spillDebt += drain
+            }
+            let chunkUnit = 16 * S * S
+            while p.spillDebt >= chunkUnit || (p.volume == 0 && p.spillDebt >= 3 * S * S) {
+                let take = min(p.spillDebt, chunkUnit)
+                p.spillDebt -= take
+                spawnPlowSpill(at: spillEdge, topY: s.top, moundH: H, area: take, source: s.key, screenIndex: p.screenIndex)
+            }
+
             let base = o.local(CGPoint(x: f, y: s.top - 2))
             p.layer.position = o.local(CGPoint(x: p.x, y: s.top - 1))
-            // wedge: tallest at the blade, sloping down ahead (area ≈ 0.6·H·L)
-            let path = CGMutablePath()
             if p.volume > 4 {
-                var H = (p.volume / 1.32).squareRoot()
-                H = min(H, p.bladeH * 1.05)
-                let L = max(10, p.volume / (0.6 * H))
-                path.move(to: CGPoint(x: base.x - 2, y: base.y))
-                path.addLine(to: CGPoint(x: base.x - 2, y: base.y + H))
-                path.addQuadCurve(to: CGPoint(x: base.x + H * 0.25, y: base.y + H * 0.98), control: CGPoint(x: base.x + H * 0.1, y: base.y + H * 1.05))
-                path.addCurve(to: CGPoint(x: base.x + L, y: base.y), control1: CGPoint(x: base.x + L * 0.45, y: base.y + H * 0.95), control2: CGPoint(x: base.x + L * 0.7, y: base.y + H * 0.2))
-                path.closeSubpath()
+                let drawH = min((p.volume / 1.32).squareRoot(), p.bladeH * 1.05)
+                let L = max(10, p.volume / (0.6 * drawH))
+                let path = CGMutablePath()
+                if L <= avail {
+                    // wedge: tallest at the blade, sloping down ahead (area ≈ 0.6·H·L)
+                    path.move(to: CGPoint(x: base.x - 2, y: base.y))
+                    path.addLine(to: CGPoint(x: base.x - 2, y: base.y + drawH))
+                    path.addQuadCurve(to: CGPoint(x: base.x + drawH * 0.25, y: base.y + drawH * 0.98), control: CGPoint(x: base.x + drawH * 0.1, y: base.y + drawH * 1.05))
+                    path.addCurve(to: CGPoint(x: base.x + L, y: base.y), control1: CGPoint(x: base.x + L * 0.45, y: base.y + drawH * 0.95), control2: CGPoint(x: base.x + L * 0.7, y: base.y + drawH * 0.2))
+                    path.closeSubpath()
+                } else {
+                    // curl over the Dock's right edge while snow pours down
+                    let overhang = min(5 * S, max(2 * S, drawH * 0.25))
+                    let visL = max(3 * S, avail + overhang)
+                    let visH = min(drawH, max(3 * S, visL * 1.6))
+                    let crestX = base.x + min(visL * 0.55, visH * 0.4)
+                    path.move(to: CGPoint(x: base.x - 2, y: base.y))
+                    path.addLine(to: CGPoint(x: base.x - 2, y: base.y + visH))
+                    path.addQuadCurve(to: CGPoint(x: crestX, y: base.y + visH * 0.96),
+                                      control: CGPoint(x: base.x + visL * 0.25, y: base.y + visH * 1.04))
+                    path.addCurve(to: CGPoint(x: base.x + visL, y: base.y - 3 * S),
+                                  control1: CGPoint(x: base.x + visL * 0.85, y: base.y + visH * 0.75),
+                                  control2: CGPoint(x: base.x + visL, y: base.y + visH * 0.2))
+                    path.addLine(to: CGPoint(x: base.x + avail, y: base.y))
+                    path.closeSubpath()
+                }
+                p.mound.path = path
+                p.mound.shadowPath = path
+            } else {
+                p.mound.path = nil
+                p.mound.shadowPath = nil
             }
-            p.mound.path = path
-            p.mound.shadowPath = path
-            if p.x - p.layer.bounds.width / 2 > s.maxX + 20 && f > o.frame.maxX + p.volume / 10 {
-                p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true
-            }
-            if p.x > o.frame.maxX + 200 * S { p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer(); return true }
             return false
         }
     }
