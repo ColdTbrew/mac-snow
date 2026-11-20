@@ -29,7 +29,7 @@ enum Showcase {
 
     static func run(outDir: String) {
         // fixed settings for the run only (argument domain: never written to disk)
-        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "campfireOn": false, "batteryMode": 2, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue],
+        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "hideInFullscreen": true, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "campfireOn": false, "batteryMode": 2, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue],
                                                 forName: UserDefaults.argumentDomain)
         S = 1.15
         dockRect = CGRect(x: 455, y: 6, width: 530, height: 64)
@@ -370,6 +370,36 @@ enum Showcase {
             engine.campfirePoint = nil
             precondition(engine.campfireVisual?.root.isHidden == true, "campfire visual should hide when turned off")
         }
+
+        // 15) Fullscreen video / app: hide overlays, Dock snow, and flakes on that display without losing them.
+        engine.piles[Engine.dockKey(0)]?.fill()
+        engine.pileDirty = true
+        step(4)
+        let dockMeanBeforeFS = engine.piles[Engine.dockKey(0)]?.mean ?? 0
+        precondition(dockMeanBeforeFS > 5 && ov.clip.opacity == 1 && ov.backClip.opacity == 1)
+        let propsBeforeFS = engine.props.count
+        fake.list.insert(.init(id: 99, frame: CGRect(origin: .zero, size: size), title: "YouTube", kind: .music), at: 0)
+        engine.refreshGeometry()
+        step(6)
+        precondition(engine.fullscreenOverlays.contains(0), "expected overlay 0 to detect fullscreen")
+        precondition(ov.clip.opacity == 0 && ov.backClip.opacity == 0, "expected front and back clips hidden in fullscreen")
+        precondition(engine.surfaces[Engine.dockKey(0)] == nil && engine.surfaces[99] == nil, "expected Dock and fullscreen surfaces hidden")
+        precondition(engine.flakes.isEmpty, "expected flakes cleared on fullscreen display")
+        engine.mouseDown(at: CGPoint(x: 400, y: size.height - 10))
+        engine.mouseUp(at: CGPoint(x: 400, y: size.height - 10))
+        precondition(engine.props.count == propsBeforeFS, "clicking in fullscreen must not spawn snowmen")
+        still("still-fullscreen-hidden")
+
+        fake.list.removeAll { $0.id == 99 }
+        engine.refreshGeometry()
+        step(6)
+        precondition(engine.fullscreenOverlays.isEmpty, "expected fullscreen state cleared on exit")
+        precondition(ov.clip.opacity == 1 && ov.backClip.opacity == 1, "expected overlays restored on exit")
+        precondition(engine.surfaces[Engine.dockKey(0)] != nil, "expected Dock surface restored")
+        let dockMeanAfterFS = engine.piles[Engine.dockKey(0)]?.mean ?? 0
+        precondition(dockMeanAfterFS >= dockMeanBeforeFS * 0.9, "expected Dock snow preserved across fullscreen")
+        print("fullscreen hide: hidden ok, restored dockMean=\(dockMeanAfterFS)")
+
         print("showcase: \(frameNo) frames -> \(outDir)")
     }
 

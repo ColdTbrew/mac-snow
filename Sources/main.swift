@@ -40,7 +40,7 @@ enum ShakeStrength: Int, CaseIterable {
 final class Settings {
     static let shared = Settings()
     private let d = UserDefaults.standard
-    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "campfireOn": false, "batteryMode": 0, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue]) }
+    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false, "hideInFullscreen": true, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "campfireOn": false, "batteryMode": 0, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue]) }
     var windOn: Bool { get { d.bool(forKey: "windOn") } set { d.set(newValue, forKey: "windOn") } }
     var windStrength: Int { get { max(0, min(2, d.integer(forKey: "windStrength"))) } set { d.set(newValue, forKey: "windStrength") } }
     /// shaking a window by its title bar knocks its snow (and snowmen) off
@@ -61,6 +61,8 @@ final class Settings {
     var autoPlow: Bool { get { d.bool(forKey: "autoPlow") } set { d.set(newValue, forKey: "autoPlow") } }
     /// false (default): falling flakes are drawn behind app windows, on the desktop only
     var flakesOnTop: Bool { get { d.bool(forKey: "flakesOnTop") } set { d.set(newValue, forKey: "flakesOnTop") } }
+    /// hide overlays on displays running a fullscreen video / app
+    var hideInFullscreen: Bool { get { d.bool(forKey: "hideInFullscreen") } set { d.set(newValue, forKey: "hideInFullscreen") } }
     var intensity: Intensity {
         get { Intensity(rawValue: d.integer(forKey: "intensity")) ?? .normal }
         set { d.set(newValue.rawValue, forKey: "intensity") }
@@ -83,16 +85,20 @@ protocol WindowProvider {
     func exists(_ id: CGWindowID) -> Bool
     /// Mission Control (or Launchpad) is showing, as of the last fetch: window frames are scaled thumbnails
     var exposeActive: Bool { get }
+    /// Frames of regular app windows covering an entire screen (e.g. fullscreen video / apps).
+    var fullscreenFrames: [CGRect] { get }
 }
 extension WindowProvider {
     /// The window still exists (maybe on another Space, minimized or hidden), i.e. it wasn't closed.
     func exists(_ id: CGWindowID) -> Bool { frame(of: id) != nil }
     var exposeActive: Bool { false }
+    var fullscreenFrames: [CGRect] { [] }
 }
 
 struct SystemWindows: WindowProvider {
     func fetch() -> [Win] { WindowList.fetch() }
     var exposeActive: Bool { WindowList.exposeActive }
+    var fullscreenFrames: [CGRect] { WindowList.fullscreenFrames }
     /// Minimized windows and windows on other Spaces only show up in the full list (not in a
     /// single-window query), so look there. Called rarely (missing windows, ≤ every 2 s each).
     func exists(_ id: CGWindowID) -> Bool {
@@ -118,21 +124,46 @@ final class SimOverride: WindowProvider {
     func frame(of id: CGWindowID) -> CGRect? { frames[id] ?? SystemWindows().frame(of: id) }
     func exists(_ id: CGWindowID) -> Bool { frames[id] != nil || SystemWindows().exists(id) }
     var exposeActive: Bool { WindowList.exposeActive }
+    var fullscreenFrames: [CGRect] { WindowList.fullscreenFrames }
 }
 
 enum WindowList {
     /// Mission Control puts a full-screen shield window (WindowManager, layer 19 on macOS 14+; the Dock
     /// on older systems) over the desktop. Owner names and layers need no screen-recording permission.
     static var exposeActive = false
+    static var fullscreenFrames: [CGRect] = []
     static let exposeLayers = 18...19
+    private static let systemOwners: Set<String> = [
+        "Window Server", "WindowManager", "Dock", "loginwindow", "ControlCenter",
+        "NotificationCenter", "Wallpaper", "Spotlight", "ScreenSaverEngine", "SystemUIServer"
+    ]
     static func fetch() -> [Win] {
         guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
-        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        let screens = NSScreen.screens
+        let primaryH = screens.first?.frame.height ?? 0
         let me = ProcessInfo.processInfo.processIdentifier
         var out: [Win] = []
-        let screenArea = NSScreen.screens.map { $0.frame.width * $0.frame.height }.max() ?? 1
+        var fsFrames: [CGRect] = []
+        let screenArea = screens.map { $0.frame.width * $0.frame.height }.max() ?? 1
         var expose = false
-        defer { exposeActive = expose }
+        defer {
+            exposeActive = expose
+            fullscreenFrames = fsFrames
+        }
+        var menuBarScreens = Set<Int>()
+        for info in raw {
+            let layer = info[kCGWindowLayer as String] as? Int ?? -1
+            let owner = info[kCGWindowOwnerName as String] as? String
+            guard owner == "Window Server", layer == 24,
+                  let b = info[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+            let w = b["Width"] ?? 0, h = b["Height"] ?? 0
+            guard w > 200, h > 10, h < 80 else { continue }
+            let x = b["X"] ?? 0, y = b["Y"] ?? 0
+            let rect = CGRect(x: x, y: primaryH - y - h, width: w, height: h)
+            for (idx, sc) in screens.enumerated() where abs(rect.minX - sc.frame.minX) <= 4 && abs(rect.maxY - sc.frame.maxY) <= 4 {
+                menuBarScreens.insert(idx)
+            }
+        }
         for info in raw {
             let layer = info[kCGWindowLayer as String] as? Int ?? -1
             let owner = info[kCGWindowOwnerName as String] as? String
@@ -140,16 +171,31 @@ enum WindowList {
                 if exposeLayers.contains(layer) { expose = true }
                 continue                      // Mission Control / Stage Manager chrome, never a surface
             }
-            guard layer >= 0, layer < 20,
+            guard layer >= 0, layer <= 1000,
                   (info[kCGWindowOwnerPID as String] as? Int32) != me,
                   let b = info[kCGWindowBounds as String] as? [String: CGFloat],
                   let id = info[kCGWindowNumber as String] as? CGWindowID else { continue }
-            if let a = info[kCGWindowAlpha as String] as? CGFloat, a < 0.1 { continue }
+            let alpha = info[kCGWindowAlpha as String] as? CGFloat ?? 1
+            if alpha < 0.1 { continue }
             let w = b["Width"] ?? 0, h = b["Height"] ?? 0
             guard w >= 80, h >= 50 else { continue }
             let x = b["X"] ?? 0, y = b["Y"] ?? 0
+            let rect = CGRect(x: x, y: primaryH - y - h, width: w, height: h)
+            if alpha >= 0.9, let pid = info[kCGWindowOwnerPID as String] as? Int32,
+               !(owner.map { systemOwners.contains($0) } ?? false) {
+                let coversScreen = screens.enumerated().contains { idx, sc in
+                    let f = sc.frame
+                    let allowedTopInset: CGFloat = menuBarScreens.contains(idx) ? 2 : max(2, sc.safeAreaInsets.top + 2)
+                    return rect.minX <= f.minX + 2 && rect.maxX >= f.maxX - 2 &&
+                           rect.minY <= f.minY + 2 && rect.maxY >= f.maxY - allowedTopInset
+                }
+                if coversScreen, NSRunningApplication(processIdentifier: pid)?.activationPolicy == .regular {
+                    fsFrames.append(rect)
+                }
+            }
+            guard layer < 20 else { continue }
             if layer > 0 && w * h > screenArea * 0.8 { continue }   // full-screen helper overlays
-            out.append(Win(id: id, frame: CGRect(x: x, y: primaryH - y - h, width: w, height: h), z: out.count, surface: layer == 0))
+            out.append(Win(id: id, frame: rect, z: out.count, surface: layer == 0))
         }
         return out
     }
@@ -927,19 +973,37 @@ final class Overlay {
     init(screen: NSScreen) {
         self.screen = screen
         frame = screen.frame
+        let hideFS = Settings.shared.hideInFullscreen
         // above Dock, below menu bar & menus
         // .transient: the window server hides it during Mission Control, in step with the animation
         // (windows there are scaled thumbnails, so snow on their old frames would float in mid-air)
-        (window, root) = Overlay.makeWindow(screen, level: Int(CGWindowLevelForKey(.dockWindow)) + 1,
-                                            behavior: [.canJoinAllSpaces, .transient, .fullScreenAuxiliary, .ignoresCycle])
+        var frontBehavior: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
         // above the wallpaper and desktop icons, below every normal window
         // falling flakes over the wallpaper stay, Mission Control included
+        var backBehavior: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        if !hideFS {
+            frontBehavior.insert(.fullScreenAuxiliary)
+            backBehavior.insert(.fullScreenAuxiliary)
+        }
+        (window, root) = Overlay.makeWindow(screen, level: Int(CGWindowLevelForKey(.dockWindow)) + 1,
+                                            behavior: frontBehavior)
         (backWindow, backRoot) = Overlay.makeWindow(screen, level: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1,
-                                                    behavior: [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle])
+                                                    behavior: backBehavior)
         // visibleFrame also leaves out the Dock, but only its top edge (the menu bar) matters here
         setUpClips(height: min(screen.frame.height, screen.visibleFrame.maxY - screen.frame.minY))
         setFlakesOnTop(Settings.shared.flakesOnTop)
         window?.orderFrontRegardless()
+    }
+
+    func updateCollectionBehavior(hideInFullscreen: Bool) {
+        var front: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
+        var back: NSWindow.CollectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        if !hideInFullscreen {
+            front.insert(.fullScreenAuxiliary)
+            back.insert(.fullScreenAuxiliary)
+        }
+        window?.collectionBehavior = front
+        backWindow?.collectionBehavior = back
     }
 
     private func setUpClips(height: CGFloat) {
@@ -1391,6 +1455,7 @@ final class Engine {
         if (Settings.shared.campfireOn && !expose) || !meltDrops.isEmpty || !campfireSparks.isEmpty || !campfireSteams.isEmpty {
             return lowPower ? 1.0 / 20 : 1.0 / 30
         }
+        if !overlays.isEmpty && fullscreenOverlays.count == overlays.count { return 0.5 }
         if Settings.shared.snowOn || !flakes.isEmpty { return lowPower ? 1.0 / 4 : 1.0 / 8 }
         if !props.isEmpty || piles.values.contains(where: { $0.mean > 0.05 }) { return 1.0 / 4 }
         return 1.0
@@ -1447,6 +1512,11 @@ final class Engine {
                            (NSWorkspace.sessionDidResignActiveNotification, true), (NSWorkspace.sessionDidBecomeActiveNotification, false)] {
             ws.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in self?.setPaused(pause) }
         }
+        ws.addObserver(forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self, !self.paused else { return }
+            DockGeometry.invalidate()
+            self.scheduleSpaceRefresh()
+        }
         let dnc = DistributedNotificationCenter.default()
         dnc.addObserver(forName: Notification.Name("com.apple.dock.prefchanged"), object: nil, queue: .main) { _ in DockGeometry.invalidate() }
         dnc.addObserver(forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main) { [weak self] _ in self?.setPaused(true) }
@@ -1494,7 +1564,7 @@ final class Engine {
         }
         if p { dropAllFlakes() }
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        campfireVisual?.root.isHidden = !Settings.shared.campfireOn || paused || expose
+        applyOverlayVisibility(animated: false)
         for o in overlays { o.root.speed = p ? 0 : 1 }   // freezes plow beacon etc. on the GPU side too
         CATransaction.commit()
         updateRate()
@@ -1524,7 +1594,7 @@ final class Engine {
         campfireVisual?.remove()
         campfireVisual = nil
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
-        if expose { for o in overlays { o.clip.opacity = 0 } }
+        applyOverlayVisibility(animated: false)
         pileViews.removeAll()
         for p in props { p.remove(); p.parent = nil }
         for p in plows { p.layer.removeFromSuperlayer(); p.mound.removeFromSuperlayer() }
@@ -1543,9 +1613,12 @@ final class Engine {
         } else {
             campfireVel = .zero; campfireLastPoint = nil; campfireMelting = false
         }
+        for o in overlays { o.updateCollectionBehavior(hideInFullscreen: Settings.shared.hideInFullscreen) }
+        if !Settings.shared.hideInFullscreen { setFullscreenOverlays([]) }
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        campfireVisual?.root.isHidden = !Settings.shared.campfireOn || paused || expose
+        applyOverlayVisibility(animated: false)
         for o in overlays { o.setFlakesOnTop(Settings.shared.flakesOnTop) }
+        refreshGeometry()
         CATransaction.commit()
         updateRate()
     }
@@ -1568,6 +1641,7 @@ final class Engine {
         setExpose(windowSource.exposeActive)
         // Mission Control: windows are shrunk thumbnails; keep the real geometry (and the snow) as it was
         if expose { return }
+        setFullscreenOverlays(detectFullscreenOverlays(wins: list))
         // while a title-bar drag is followed by prediction, the list's (older) frame mustn't pull it back
         if let d = drag, d.confirmed, let i = list.firstIndex(where: { $0.id == d.id }),
            let cur = wins.first(where: { $0.id == d.id }) {
@@ -1578,23 +1652,126 @@ final class Engine {
 
     /// Mission Control is up: fade all the snow on windows / the Dock out, and back in when it closes.
     var expose = false
+    var fullscreenOverlays = Set<Int>()
+    var spaceChecks: [DispatchWorkItem] = []
+
+    func scheduleSpaceRefresh() {
+        guard virtualNow == nil else { return }
+        spaceChecks.forEach { $0.cancel() }
+        spaceChecks = [0, 0.25].map { delay in
+            let item = DispatchWorkItem { [weak self] in
+                guard let self, !self.paused else { return }
+                CATransaction.begin(); CATransaction.setDisableActions(true)
+                self.refreshGeometry()
+                CATransaction.commit()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+            return item
+        }
+    }
+
+    func coversOverlay(_ rect: CGRect, overlay o: Overlay) -> Bool {
+        let f = o.frame
+        return rect.minX <= f.minX + 2 && rect.maxX >= f.maxX - 2 &&
+               rect.minY <= f.minY + 2 && rect.maxY >= f.maxY - 2
+    }
+
+    func detectFullscreenOverlays(wins list: [Win]) -> Set<Int> {
+        guard Settings.shared.hideInFullscreen else { return [] }
+        let fsFrames = windowSource.fullscreenFrames
+        var result = Set<Int>()
+        for (i, o) in overlays.enumerated() {
+            if let w = o.window, !w.isOnActiveSpace {
+                result.insert(i); continue
+            }
+            if fsFrames.contains(where: { r in
+                let f = o.frame
+                let topInset = o.screen.map { max(2, $0.safeAreaInsets.top + 2) } ?? 2
+                return r.minX <= f.minX + 2 && r.maxX >= f.maxX - 2 &&
+                       r.minY <= f.minY + 2 && r.maxY >= f.maxY - topInset
+            }) {
+                result.insert(i); continue
+            }
+            if list.contains(where: { coversOverlay($0.frame, overlay: o) }) {
+                result.insert(i)
+            }
+        }
+        return result
+    }
+
+    func isFullscreen(at p: CGPoint) -> Bool {
+        guard !fullscreenOverlays.isEmpty else { return false }
+        if let i = overlays.firstIndex(where: { $0.frame.contains(p) }) {
+            return fullscreenOverlays.contains(i)
+        }
+        return false
+    }
+
     func setExpose(_ on: Bool) {
         guard on != expose else { return }
         expose = on; exposeAt = CACurrentMediaTime()
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        campfireVisual?.root.isHidden = !Settings.shared.campfireOn || paused || expose
-        for o in overlays { fadeClip(o) }
+        applyOverlayVisibility(animated: true)
         CATransaction.commit()
         updateRate()
     }
-    func fadeClip(_ o: Overlay) {
-        let to: Float = expose ? 0 : 1
-        guard o.clip.opacity != to else { return }
+
+    func setFullscreenOverlays(_ next: Set<Int>) {
+        guard next != fullscreenOverlays else { return }
+        let added = next.subtracting(fullscreenOverlays)
+        fullscreenOverlays = next
+        if !added.isEmpty {
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            var kept: [Flake] = []
+            kept.reserveCapacity(flakes.count)
+            for f in flakes {
+                if added.contains(where: { $0 < overlays.count && overlays[$0] === f.overlay }) {
+                    f.layer.removeAllAnimations(); f.layer.removeFromSuperlayer(); flakePool.append(f.layer)
+                } else {
+                    kept.append(f)
+                }
+            }
+            flakes = kept
+            if let r = roll, overlays.indices.contains(where: { added.contains($0) && overlays[$0].frame.contains(CGPoint(x: r.startMinX + r.localX, y: r.startTop)) }) {
+                rollCancel()
+            }
+            if let c = carry, isFullscreen(at: c.prop.pos) {
+                carryCancel()
+            }
+            CATransaction.commit()
+        }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        applyOverlayVisibility(animated: true)
+        CATransaction.commit()
+        updateRate()
+    }
+
+    private func fadeLayer(_ layer: CALayer, to: Float, duration: CFTimeInterval) {
+        guard layer.opacity != to else { return }
+        if duration <= 0 || virtualNow != nil {
+            layer.removeAnimation(forKey: "fade")
+            layer.opacity = to
+            return
+        }
         let a = CABasicAnimation(keyPath: "opacity")
-        a.fromValue = o.clip.presentation()?.opacity ?? o.clip.opacity
-        a.toValue = to; a.duration = expose ? 0.06 : 0.3
-        o.clip.opacity = to
-        o.clip.add(a, forKey: "fade")
+        a.fromValue = layer.presentation()?.opacity ?? layer.opacity
+        a.toValue = to; a.duration = duration
+        layer.opacity = to
+        layer.add(a, forKey: "fade")
+    }
+
+    func applyOverlayVisibility(animated: Bool = true) {
+        let fsPoint = campfirePoint.map { isFullscreen(at: $0) } ?? false
+        campfireVisual?.root.isHidden = !Settings.shared.campfireOn || paused || expose || fsPoint
+        for (i, o) in overlays.enumerated() {
+            let fs = fullscreenOverlays.contains(i)
+            let frontTo: Float = (expose || fs) ? 0 : 1
+            let backTo: Float = fs ? 0 : 1
+            let frontDur: CFTimeInterval = animated ? ((expose || fs) ? 0.08 : 0.25) : 0
+            let backDur: CFTimeInterval = animated ? (fs ? 0.08 : 0.25) : 0
+            fadeLayer(o.clip, to: frontTo, duration: frontDur)
+            fadeLayer(o.backClip, to: backTo, duration: backDur)
+        }
     }
 
     /// Put the dragged window at `f` and move its snow + snowmen right now (no implicit animation).
@@ -1648,9 +1825,12 @@ final class Engine {
         }
         var s: [UInt64: Surface] = [:]
         for w in wins where w.surface {
+            if overlays.indices.contains(where: { fullscreenOverlays.contains($0) && coversOverlay(w.frame, overlay: overlays[$0]) }) {
+                continue
+            }
             s[UInt64(w.id)] = Surface(key: UInt64(w.id), minX: w.frame.minX, maxX: w.frame.maxX, top: w.frame.maxY, z: w.z)
         }
-        for (i, o) in overlays.enumerated() {
+        for (i, o) in overlays.enumerated() where !fullscreenOverlays.contains(i) {
             if let (a, b, t) = dockSource(o) {
                 s[Engine.dockKey(i)] = Surface(key: Engine.dockKey(i), minX: a, maxX: b, top: t, z: -1)
             }
@@ -1769,6 +1949,7 @@ final class Engine {
     func mouseWind(at p: CGPoint) {
         let windOn = Settings.shared.windOn, meltOn = Settings.shared.meltOn
         guard (windOn || meltOn), !paused else { return }
+        if isFullscreen(at: p) { windPoint = nil; return }
         let hasIcicles = meltOn && piles.values.contains { $0.icicles.contains { $0.length >= 2 * S } }
         if !windOn && !hasIcicles { windPoint = nil; return }
         let now = clock(), previous = windPoint, elapsed = now - windTime
@@ -2089,7 +2270,7 @@ final class Engine {
         let rate = (lowPower && intensity == .blizzard ? Intensity.heavy : intensity).flakeRate * (lowPower ? 0.5 : 1)
         // highest surfaces first: a flake crossing a window top sticks with some chance, otherwise
         // keeps falling in front of it to the windows / Dock further down (windows are layered).
-        for o in overlays {
+        for (i, o) in overlays.enumerated() where !fullscreenOverlays.contains(i) {
             let f = o.frame
             spawnDebt += rate * f.width / 100 * dt
             while spawnDebt >= 1 {
@@ -2952,6 +3133,10 @@ final class Engine {
         guard Settings.shared.campfireOn, p.x.isFinite, p.y.isFinite else { return }
         campfirePoint = p
         guard !paused, !expose, !overlays.isEmpty, let vis = campfireVisual else { return }
+        if isFullscreen(at: p) {
+            vis.root.isHidden = true
+            return
+        }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         let o = overlays[overlayIndex(for: p)]
         if vis.parent !== o.actors {
@@ -2980,8 +3165,10 @@ final class Engine {
         if virtualNow == nil {
             campfirePoint = NSEvent.mouseLocation
         }
-        guard let p = campfirePoint, p.x.isFinite, p.y.isFinite else {
+        guard let p = campfirePoint, p.x.isFinite, p.y.isFinite, !isFullscreen(at: p) else {
             campfireVisual?.root.isHidden = true
+            campfireVel = .zero
+            campfireLastPoint = nil
             return
         }
 
@@ -3407,7 +3594,7 @@ final class Engine {
         downIcicle = nil
         mouseIsDown = true
         refreshGeometry()
-        if expose { downPoint = nil; downWin = nil; drag = nil; rollCancel(); return }   // Mission Control clicks
+        if expose || isFullscreen(at: p) { downPoint = nil; downWin = nil; drag = nil; rollCancel(); return }   // Mission Control / fullscreen clicks
         downPoint = p
         downTime = clock()
         downWin = topWindow(at: p, in: wins)
@@ -3433,6 +3620,7 @@ final class Engine {
     }
 
     func mouseDragged(to p: CGPoint) {
+        if isFullscreen(at: p) && drag == nil && carry == nil && roll == nil { return }
         if carry != nil { refreshGeometry() }
         // Run after the window check, including its early returns: the same press reaches
         // the window behind our click-through overlay and may confirm a title-bar drag.
@@ -3603,6 +3791,7 @@ final class Engine {
             return
         }
         let rolled = rollEnd()
+        guard !isFullscreen(at: p) else { downPoint = nil; return }
         guard !rolled, let d = downPoint else { downPoint = nil; return }
         downPoint = nil
         guard hypot(p.x - d.x, p.y - d.y) < 4, clock() - downTime < 0.6 else { return }
@@ -3669,7 +3858,7 @@ final class Engine {
         let settings = Settings.shared
         out += "settings intensity=\(settings.intensity.rawValue) wind=\(settings.windOn)/\(settings.windStrength) melt=\(settings.meltOn)/\(settings.meltSpeed) campfire=\(settings.campfireOn) battery=\(settings.batteryMode.rawValue) lowPower=\(lowPower) onAC=\(onAC) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled) login=\(SMAppService.mainApp.status.rawValue)\n"
         out += "wind gusts=\(windGusts) pushed=\(windPushed) dust=\(windDust) campfireDrops=\(meltDrops.count) campfireSparks=\(campfireSparks.count)\n"
-        out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1)\n"
+        out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1) fullscreen=\(fullscreenOverlays.sorted()) hideFS=\(settings.hideInFullscreen)\n"
         out += "shake on=\(settings.shakeOn) strength=\(settings.shakeStrength.rawValue) jolts=\(shakeJolts) sheds=\(shakeSheds) drags=\(dragCount)\n"
         for (k, p) in piles where k < Engine.dockKey(0) {
             let lengths = p.icicles.map(\.length).filter { $0 > 0 }
@@ -3831,6 +4020,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("눈사람 (Snowmen) — 제목줄 클릭 / 눈 굴리기", #selector(toggleSnowmen), on: s.snowmenOn)
         add("제설차 자동 (Auto plow)", #selector(toggleAutoPlow), on: s.autoPlow)
         add("눈송이 창 위로 (Flakes over windows)", #selector(toggleFlakesOnTop), on: s.flakesOnTop)
+        add("전체화면에서 숨기기 (Hide in full screen)", #selector(toggleHideInFullscreen), on: s.hideInFullscreen)
         if !AXIsProcessTrusted() {
             add("Dock 크기 정확히 맞추기 (손쉬운 사용 권한)", #selector(requestDockAccess))
         }
@@ -3869,6 +4059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleSnowmen() { Settings.shared.snowmenOn.toggle(); engine.applySettings() }
     @objc func toggleAutoPlow() { Settings.shared.autoPlow.toggle() }
     @objc func toggleFlakesOnTop() { Settings.shared.flakesOnTop.toggle(); engine.applySettings() }
+    @objc func toggleHideInFullscreen() { Settings.shared.hideInFullscreen.toggle(); engine.applySettings() }
     @objc func setIntensity(_ i: NSMenuItem) { Settings.shared.intensity = Intensity(rawValue: i.tag) ?? .normal; engine.updateRate() }
     /// Not trusted yet: show the system Accessibility prompt once per build. A rebuilt (ad-hoc signed)
     /// binary loses the earlier grant, so the key is the executable's build time. The menu item stays.
