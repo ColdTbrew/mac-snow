@@ -40,7 +40,7 @@ enum ShakeStrength: Int, CaseIterable {
 final class Settings {
     static let shared = Settings()
     private let d = UserDefaults.standard
-    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 0, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue]) }
+    init() { d.register(defaults: ["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": true, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "campfireOn": false, "batteryMode": 0, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue]) }
     var windOn: Bool { get { d.bool(forKey: "windOn") } set { d.set(newValue, forKey: "windOn") } }
     var windStrength: Int { get { max(0, min(2, d.integer(forKey: "windStrength"))) } set { d.set(newValue, forKey: "windStrength") } }
     /// shaking a window by its title bar knocks its snow (and snowmen) off
@@ -51,6 +51,7 @@ final class Settings {
     }
     var meltOn: Bool { get { d.bool(forKey: "meltOn") } set { d.set(newValue, forKey: "meltOn") } }
     var meltSpeed: Int { get { max(0, min(2, d.integer(forKey: "meltSpeed"))) } set { d.set(newValue, forKey: "meltSpeed") } }
+    var campfireOn: Bool { get { d.bool(forKey: "campfireOn") } set { d.set(newValue, forKey: "campfireOn") } }
     var batteryMode: BatteryMode {
         get { BatteryMode(rawValue: d.integer(forKey: "batteryMode")) ?? .auto }
         set { d.set(newValue.rawValue, forKey: "batteryMode") }
@@ -615,6 +616,273 @@ func makePlowLayer(px: CGFloat) -> (CALayer, CGFloat) {
     return (root, 15 * px)
 }
 
+enum CampfireAssets {
+    /// Soft warm radial amber/orange glow halo behind the campfire.
+    static let glowImage: CGImage? = {
+        let size = 128
+        guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let colors = [
+            CGColor(srgbRed: 1.0, green: 0.78, blue: 0.24, alpha: 0.48),
+            CGColor(srgbRed: 1.0, green: 0.46, blue: 0.08, alpha: 0.26),
+            CGColor(srgbRed: 0.96, green: 0.25, blue: 0.03, alpha: 0.09),
+            CGColor(srgbRed: 0.95, green: 0.20, blue: 0.00, alpha: 0.0),
+        ] as CFArray
+        let locs: [CGFloat] = [0, 0.34, 0.70, 1.0]
+        if let grad = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: colors, locations: locs) {
+            let c = CGPoint(x: CGFloat(size) / 2, y: CGFloat(size) / 2)
+            ctx.drawRadialGradient(grad, startCenter: c, startRadius: 0, endCenter: c, endRadius: CGFloat(size) / 2, options: [])
+        }
+        return ctx.makeImage()
+    }()
+
+    /// Glistening translucent sky-blue teardrop for melted snow flowing down.
+    static let dropImage: CGImage? = {
+        let w = 32, h = 48
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 16, y: 45))
+        path.addCurve(to: CGPoint(x: 27, y: 16), control1: CGPoint(x: 19, y: 35), control2: CGPoint(x: 27, y: 26))
+        path.addCurve(to: CGPoint(x: 16, y: 4), control1: CGPoint(x: 27, y: 8.5), control2: CGPoint(x: 22.2, y: 4))
+        path.addCurve(to: CGPoint(x: 5, y: 16), control1: CGPoint(x: 9.8, y: 4), control2: CGPoint(x: 5, y: 8.5))
+        path.addCurve(to: CGPoint(x: 16, y: 45), control1: CGPoint(x: 5, y: 26), control2: CGPoint(x: 13, y: 35))
+        path.closeSubpath()
+
+        ctx.saveGState()
+        ctx.addPath(path)
+        ctx.clip()
+        let colors = [
+            CGColor(srgbRed: 0.72, green: 0.94, blue: 1.0, alpha: 0.76),
+            CGColor(srgbRed: 0.34, green: 0.76, blue: 0.99, alpha: 0.85),
+            CGColor(srgbRed: 0.16, green: 0.56, blue: 0.96, alpha: 0.92),
+        ] as CFArray
+        if let grad = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: colors, locations: [0, 0.52, 1]) {
+            ctx.drawLinearGradient(grad, start: CGPoint(x: 16, y: 45), end: CGPoint(x: 16, y: 4), options: [])
+        }
+        ctx.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.8))
+        ctx.fillEllipse(in: CGRect(x: 9.2, y: 14.5, width: 4.8, height: 8.5))
+        ctx.setFillColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.52))
+        ctx.fillEllipse(in: CGRect(x: 11.2, y: 9.2, width: 2.6, height: 2.8))
+        ctx.restoreGState()
+
+        ctx.addPath(path)
+        ctx.setStrokeColor(CGColor(srgbRed: 0.82, green: 0.96, blue: 1.0, alpha: 0.82))
+        ctx.setLineWidth(1.5)
+        ctx.strokePath()
+        return ctx.makeImage()
+    }()
+
+    /// Bright sky-blue round water splash droplet.
+    static let splashImage: CGImage? = {
+        let size = 24
+        guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let r = CGRect(x: 3, y: 3, width: 18, height: 18)
+        ctx.saveGState()
+        ctx.addEllipse(in: r)
+        ctx.clip()
+        let colors = [
+            CGColor(srgbRed: 0.86, green: 0.97, blue: 1.0, alpha: 0.95),
+            CGColor(srgbRed: 0.34, green: 0.78, blue: 1.0, alpha: 0.88),
+        ] as CFArray
+        if let grad = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: colors, locations: [0, 1]) {
+            ctx.drawRadialGradient(grad, startCenter: CGPoint(x: 9, y: 15), startRadius: 1,
+                                   endCenter: CGPoint(x: 12, y: 12), endRadius: 10, options: [])
+        }
+        ctx.restoreGState()
+        ctx.setStrokeColor(CGColor(srgbRed: 0.88, green: 0.98, blue: 1.0, alpha: 0.82))
+        ctx.setLineWidth(1.2)
+        ctx.strokeEllipse(in: r)
+        return ctx.makeImage()
+    }()
+
+    /// Soft radial translucent white steam puff.
+    static let steamImage: CGImage? = {
+        let size = 48
+        guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        let colors = [
+            CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.55),
+            CGColor(srgbRed: 0.94, green: 0.97, blue: 1, alpha: 0.24),
+            CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.0),
+        ] as CFArray
+        if let grad = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB), colors: colors, locations: [0, 0.55, 1]) {
+            let c = CGPoint(x: CGFloat(size) / 2, y: CGFloat(size) / 2)
+            ctx.drawRadialGradient(grad, startCenter: c, startRadius: 0, endCenter: c, endRadius: CGFloat(size) / 2, options: [])
+        }
+        return ctx.makeImage()
+    }()
+}
+
+/// Click-through animated campfire attached to the cursor: warm glow halo, crossed logs,
+/// glowing ember coals, and 3 layered flickering flames that lean opposite cursor velocity.
+final class CampfireVisual {
+    let root = CALayer()
+    let glow = CALayer()
+    let logs = CALayer()
+    let coals = CAShapeLayer()
+    let coalGlow = CAShapeLayer()
+    let outerFlame = CAShapeLayer()
+    let midFlame = CAShapeLayer()
+    let innerFlame = CAShapeLayer()
+    weak var parent: CALayer?
+
+    init() {
+        root.zPosition = 1000
+        let s = S
+
+        glow.bounds = CGRect(x: 0, y: 0, width: 82 * s, height: 82 * s)
+        glow.position = CGPoint(x: 0, y: 4 * s)
+        glow.contents = CampfireAssets.glowImage
+        glow.contentsGravity = .resize
+        root.addSublayer(glow)
+
+        let barkDark = NSColor(calibratedRed: 0.30, green: 0.16, blue: 0.08, alpha: 1)
+        let barkLight = NSColor(calibratedRed: 0.44, green: 0.24, blue: 0.11, alpha: 1)
+        let barkEdge = NSColor(calibratedRed: 0.18, green: 0.09, blue: 0.04, alpha: 1)
+        let woodCut = NSColor(calibratedRed: 0.68, green: 0.48, blue: 0.28, alpha: 1)
+
+        func makeLog(angle: CGFloat, fill: NSColor, cutRight: Bool) -> CALayer {
+            let l = CALayer()
+            let len = 25 * s, thick = 4.8 * s
+            let body = CGMutablePath()
+            body.addRoundedRect(in: CGRect(x: -len / 2, y: -thick / 2, width: len, height: thick),
+                                cornerWidth: thick * 0.42, cornerHeight: thick * 0.42)
+            l.addSublayer(shape(body, fill: fill, stroke: barkEdge, lw: 0.8 * s))
+            let grain = CGMutablePath()
+            grain.move(to: CGPoint(x: -len * 0.32, y: thick * 0.14))
+            grain.addLine(to: CGPoint(x: len * 0.20, y: thick * 0.14))
+            grain.move(to: CGPoint(x: -len * 0.14, y: -thick * 0.16))
+            grain.addLine(to: CGPoint(x: len * 0.30, y: -thick * 0.16))
+            l.addSublayer(shape(grain, fill: .clear, stroke: barkEdge.withAlphaComponent(0.45), lw: 0.6 * s))
+            let cx = cutRight ? (len / 2 - thick * 0.32) : (-len / 2 + thick * 0.32)
+            let endRect = CGRect(x: cx - thick * 0.28, y: -thick * 0.36, width: thick * 0.56, height: thick * 0.72)
+            l.addSublayer(shape(CGPath(ellipseIn: endRect, transform: nil), fill: woodCut, stroke: barkEdge, lw: 0.5 * s))
+            l.position = CGPoint(x: 0, y: -6.5 * s)
+            l.setAffineTransform(CGAffineTransform(rotationAngle: angle))
+            return l
+        }
+        logs.addSublayer(makeLog(angle: 0.36, fill: barkDark, cutRight: false))
+        logs.addSublayer(makeLog(angle: -0.36, fill: barkLight, cutRight: true))
+        logs.shadowColor = NSColor.black.cgColor
+        logs.shadowOpacity = 0.35
+        logs.shadowRadius = 2 * s
+        logs.shadowOffset = CGSize(width: 0, height: -1 * s)
+        root.addSublayer(logs)
+
+        let coalPath = CGMutablePath()
+        for (x, y, rx, ry) in [(-4.8, -7.8, 2.3, 1.4), (0.0, -8.5, 2.8, 1.6), (4.6, -7.7, 2.2, 1.4),
+                               (-2.0, -5.8, 2.1, 1.3), (2.5, -6.0, 2.0, 1.3)] as [(CGFloat, CGFloat, CGFloat, CGFloat)] {
+            coalPath.addEllipse(in: CGRect(x: (x - rx) * s, y: (y - ry) * s, width: 2 * rx * s, height: 2 * ry * s))
+        }
+        coals.path = coalPath
+        coals.fillColor = NSColor(calibratedRed: 0.92, green: 0.28, blue: 0.04, alpha: 0.95).cgColor
+        coals.contentsScale = 2
+        root.addSublayer(coals)
+
+        let hotPath = CGMutablePath()
+        for (x, y, rx, ry) in [(-3.6, -7.4, 1.3, 0.8), (0.2, -8.0, 1.8, 1.0), (3.4, -7.4, 1.2, 0.8),
+                               (0.0, -5.8, 1.6, 0.9)] as [(CGFloat, CGFloat, CGFloat, CGFloat)] {
+            hotPath.addEllipse(in: CGRect(x: (x - rx) * s, y: (y - ry) * s, width: 2 * rx * s, height: 2 * ry * s))
+        }
+        coalGlow.path = hotPath
+        coalGlow.fillColor = NSColor(calibratedRed: 1.0, green: 0.74, blue: 0.16, alpha: 0.96).cgColor
+        coalGlow.contentsScale = 2
+        root.addSublayer(coalGlow)
+
+        outerFlame.fillColor = NSColor(calibratedRed: 0.96, green: 0.28, blue: 0.05, alpha: 0.94).cgColor
+        outerFlame.shadowColor = NSColor(calibratedRed: 1.0, green: 0.42, blue: 0.04, alpha: 1).cgColor
+        outerFlame.shadowOpacity = 0.65
+        outerFlame.shadowRadius = 5 * s
+        outerFlame.shadowOffset = .zero
+        outerFlame.contentsScale = 2
+
+        midFlame.fillColor = NSColor(calibratedRed: 1.0, green: 0.62, blue: 0.08, alpha: 0.96).cgColor
+        midFlame.contentsScale = 2
+
+        innerFlame.fillColor = NSColor(calibratedRed: 1.0, green: 0.94, blue: 0.62, alpha: 0.98).cgColor
+        innerFlame.contentsScale = 2
+
+        root.addSublayer(outerFlame)
+        root.addSublayer(midFlame)
+        root.addSublayer(innerFlame)
+        update(phase: 0, velocity: .zero)
+    }
+
+    private func flamePath(baseX: CGFloat = 0, baseY: CGFloat, halfW: CGFloat, height: CGFloat, tipX: CGFloat, bellyShift: CGFloat) -> CGPath {
+        let p = CGMutablePath()
+        let tip = CGPoint(x: baseX + tipX, y: baseY + height)
+        let bottom = CGPoint(x: baseX, y: baseY - halfW * 0.24)
+        p.move(to: bottom)
+        p.addCurve(
+            to: CGPoint(x: baseX + halfW * 0.84 + bellyShift * 0.45, y: baseY + height * 0.34),
+            control1: CGPoint(x: baseX + halfW * 0.72, y: baseY - halfW * 0.18),
+            control2: CGPoint(x: baseX + halfW * 1.08 + bellyShift * 0.25, y: baseY + height * 0.14)
+        )
+        p.addCurve(
+            to: tip,
+            control1: CGPoint(x: baseX + halfW * 0.56 + tipX * 0.48, y: baseY + height * 0.62),
+            control2: CGPoint(x: baseX + tipX + halfW * 0.16, y: baseY + height * 0.84)
+        )
+        p.addCurve(
+            to: CGPoint(x: baseX - halfW * 0.84 + bellyShift * 0.45, y: baseY + height * 0.34),
+            control1: CGPoint(x: baseX + tipX - halfW * 0.16, y: baseY + height * 0.84),
+            control2: CGPoint(x: baseX - halfW * 0.56 + tipX * 0.48, y: baseY + height * 0.62)
+        )
+        p.addCurve(
+            to: bottom,
+            control1: CGPoint(x: baseX - halfW * 1.08 + bellyShift * 0.25, y: baseY + height * 0.14),
+            control2: CGPoint(x: baseX - halfW * 0.72, y: baseY - halfW * 0.18)
+        )
+        p.closeSubpath()
+        return p
+    }
+
+    func update(phase: CGFloat, velocity: CGPoint) {
+        let s = S
+        let leanX = max(-14 * s, min(14 * s, -velocity.x * 0.018))
+        let stretchY = max(-3.5 * s, min(5.5 * s, -velocity.y * 0.005))
+
+        let sway1 = sin(phase * 8.6) * 2.1 * s + sin(phase * 14.3 + 1.2) * 0.9 * s
+        let sway2 = sin(phase * 10.8 + 0.8) * 1.5 * s + cos(phase * 16.5) * 0.6 * s
+        let sway3 = sin(phase * 13.4 + 2.1) * 0.8 * s
+        let pulse1 = 1 + 0.09 * sin(phase * 11.2) + 0.05 * cos(phase * 17.6)
+        let pulse2 = 1 + 0.11 * sin(phase * 13.7 + 0.9)
+        let pulse3 = 1 + 0.13 * cos(phase * 16.1 + 1.7)
+
+        let outer = CGMutablePath()
+        outer.addPath(flamePath(baseY: -4.8 * s, halfW: 9.2 * s, height: (24.5 * s + stretchY) * pulse1,
+                                tipX: leanX + sway1, bellyShift: leanX * 0.25 + sway1 * 0.3))
+        let leftLickH = (11.5 + 2.2 * sin(phase * 12.1 + 0.4)) * s
+        outer.addPath(flamePath(baseX: -4.5 * s, baseY: -4.6 * s, halfW: 3.3 * s, height: leftLickH,
+                                tipX: -2.0 * s + leanX * 0.65 + sway2 * 0.7, bellyShift: -0.8 * s + leanX * 0.15))
+        let rightLickH = (10.5 + 2.0 * cos(phase * 13.3 + 1.5)) * s
+        outer.addPath(flamePath(baseX: 4.5 * s, baseY: -4.6 * s, halfW: 3.1 * s, height: rightLickH,
+                                tipX: 1.8 * s + leanX * 0.65 - sway2 * 0.6, bellyShift: 0.8 * s + leanX * 0.15))
+        outerFlame.path = outer
+
+        midFlame.path = flamePath(baseY: -4.4 * s, halfW: 6.4 * s, height: (17.5 * s + stretchY * 0.65) * pulse2,
+                                  tipX: leanX * 0.72 + sway2, bellyShift: leanX * 0.18 + sway2 * 0.25)
+        innerFlame.path = flamePath(baseY: -4.0 * s, halfW: 3.5 * s, height: (10.5 * s + stretchY * 0.35) * pulse3,
+                                    tipX: leanX * 0.42 + sway3, bellyShift: leanX * 0.10 + sway3 * 0.2)
+
+        let glowPulse = 0.94 + 0.08 * sin(phase * 5.3) + 0.04 * cos(phase * 9.7)
+        glow.opacity = Float(0.80 + 0.18 * sin(phase * 4.7) * cos(phase * 2.3))
+        glow.setAffineTransform(CGAffineTransform(scaleX: glowPulse, y: glowPulse))
+        coalGlow.opacity = Float(0.70 + 0.28 * (0.5 + 0.5 * sin(phase * 6.4)))
+    }
+
+    func remove() {
+        root.removeFromSuperlayer()
+        parent = nil
+    }
+}
+
 // MARK: - Overlay per screen
 
 final class Overlay {
@@ -855,6 +1123,43 @@ final class Carry {
     func position(at p: CGPoint) -> CGPoint { CGPoint(x: p.x + offset.width, y: p.y + offset.height) }
 }
 
+/// Melted snow flowing down as glistening sky-blue water droplets / trickling streams.
+struct MeltDrop {
+    let layer: CALayer
+    var pos: CGPoint
+    var vx: CGFloat
+    var vy: CGFloat
+    var width: CGFloat
+    var cling: CGFloat          // > 0: clinging trickle slowly sliding down edge before falling
+    let source: UInt64
+    let fromDock: Bool
+    let isSplash: Bool
+    var ttl: CGFloat            // finite for splash droplets, .infinity for falling drops
+    let maxTTL: CGFloat
+}
+
+/// Glowing ember spark rising from the campfire cursor.
+struct CampfireSpark {
+    let layer: CALayer
+    var pos: CGPoint
+    var vx: CGFloat
+    var vy: CGFloat
+    var age: CGFloat
+    let life: CGFloat
+    let phase: CGFloat
+}
+
+/// Faint translucent white steam puff rising from actively melting snow.
+struct CampfireSteam {
+    let layer: CALayer
+    var pos: CGPoint
+    var vx: CGFloat
+    var vy: CGFloat
+    var age: CGFloat
+    let life: CGFloat
+    let baseSize: CGFloat
+}
+
 // MARK: - Engine
 
 /// Selector target for CADisplayLink (Engine isn't an NSObject).
@@ -879,6 +1184,21 @@ final class Engine {
     var plows: [Plow] = []
     var roll: Roll?
     var carry: Carry?
+    var campfireVisual: CampfireVisual?
+    var campfirePoint: CGPoint?
+    var campfireLastPoint: CGPoint?
+    var campfireVel: CGPoint = .zero
+    var campfirePhase: CGFloat = 0
+    var campfireMelting = false
+    var meltDrops: [MeltDrop] = []
+    var meltDropPool: [CALayer] = []
+    var campfireSparks: [CampfireSpark] = []
+    var sparkPool: [CALayer] = []
+    var campfireSteams: [CampfireSteam] = []
+    var steamPool: [CALayer] = []
+    var meltWaterDebt: CGFloat = 0
+    var sparkDebt: CGFloat = 0
+    var lastSteam: CFTimeInterval = -.infinity
     var timer: Timer?
     var interval: Double = 0
     var paused = false
@@ -886,7 +1206,8 @@ final class Engine {
     var onAC = true
     var powerSource: CFRunLoopSource?
     var lastMelt = CACurrentMediaTime()
-    var windMonitor: Any?
+    var mouseMoveMonitor: Any?
+    var mouseMoveMask: NSEvent.EventTypeMask = []
     var windPoint: CGPoint?
     var windTime: CFTimeInterval = 0
     var lastGust: CFTimeInterval = -.infinity
@@ -1067,6 +1388,9 @@ final class Engine {
         if paused { return nil }
         if mouseIsDown || forceFast { return lowPower ? 1.0 / 30 : 1.0 / 60 }
         if roll != nil || !plows.isEmpty || !spills.isEmpty || !waterDrops.isEmpty || props.contains(where: { !$0.grounded }) { return 1.0 / 30 }
+        if (Settings.shared.campfireOn && !expose) || !meltDrops.isEmpty || !campfireSparks.isEmpty || !campfireSteams.isEmpty {
+            return lowPower ? 1.0 / 20 : 1.0 / 30
+        }
         if Settings.shared.snowOn || !flakes.isEmpty { return lowPower ? 1.0 / 4 : 1.0 / 8 }
         if !props.isEmpty || piles.values.contains(where: { $0.mean > 0.05 }) { return 1.0 / 4 }
         return 1.0
@@ -1159,6 +1483,7 @@ final class Engine {
         guard p != paused, !noPause else { return }
         paused = p
         lastMelt = clock(); windPoint = nil
+        campfireVel = .zero; campfireLastPoint = nil
         pauseWatch?.invalidate(); pauseWatch = nil
         if p {
             // every 2 s while paused: resume if we are actually unlocked and awake
@@ -1168,7 +1493,10 @@ final class Engine {
             pauseWatch?.tolerance = 1
         }
         if p { dropAllFlakes() }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        campfireVisual?.root.isHidden = !Settings.shared.campfireOn || paused || expose
         for o in overlays { o.root.speed = p ? 0 : 1 }   // freezes plow beacon etc. on the GPU side too
+        CATransaction.commit()
         updateRate()
     }
 
@@ -1176,9 +1504,16 @@ final class Engine {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         for f in flakes { f.layer.removeAllAnimations(); f.layer.removeFromSuperlayer(); flakePool.append(f.layer) }
         for f in spills { f.layer.removeFromSuperlayer(); f.layer.opacity = 1; flakePool.append(f.layer) }
+        for d in meltDrops { d.layer.removeFromSuperlayer(); d.layer.opacity = 1; meltDropPool.append(d.layer) }
+        for sp in campfireSparks { sp.layer.removeFromSuperlayer(); sp.layer.opacity = 1; sparkPool.append(sp.layer) }
+        for st in campfireSteams { st.layer.removeFromSuperlayer(); st.layer.opacity = 1; steamPool.append(st.layer) }
         spills.removeAll()
         for d in waterDrops { d.layer.removeFromSuperlayer() }
         waterDrops.removeAll()
+        meltDrops.removeAll()
+        campfireSparks.removeAll()
+        campfireSteams.removeAll()
+        meltWaterDebt = 0; sparkDebt = 0
         CATransaction.commit()
         flakes.removeAll()
     }
@@ -1186,6 +1521,8 @@ final class Engine {
     func rebuildOverlays() {
         for o in overlays { o.window?.orderOut(nil); o.backWindow?.orderOut(nil) }
         dropAllFlakes()
+        campfireVisual?.remove()
+        campfireVisual = nil
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
         if expose { for o in overlays { o.clip.opacity = 0 } }
         pileViews.removeAll()
@@ -1196,13 +1533,21 @@ final class Engine {
     }
 
     func applySettings() {
-        updateWindMonitor()
+        updateMouseMoveMonitor()
         lastMelt = clock()
         for v in pileViews.values { v.icicles.isHidden = !Settings.shared.meltOn }
         if !Settings.shared.snowmenOn { removeAllProps() }
+        if Settings.shared.campfireOn {
+            rollCancel()
+            if virtualNow == nil { campfirePoint = NSEvent.mouseLocation }
+        } else {
+            campfireVel = .zero; campfireLastPoint = nil; campfireMelting = false
+        }
         CATransaction.begin(); CATransaction.setDisableActions(true)
+        campfireVisual?.root.isHidden = !Settings.shared.campfireOn || paused || expose
         for o in overlays { o.setFlakesOnTop(Settings.shared.flakesOnTop) }
         CATransaction.commit()
+        updateRate()
     }
 
     func clearSnow() { piles.removeAll(); dropAllFlakes(); pileDirty = true; geometryChanged = true; removeAllProps() }
@@ -1237,8 +1582,10 @@ final class Engine {
         guard on != expose else { return }
         expose = on; exposeAt = CACurrentMediaTime()
         CATransaction.begin(); CATransaction.setDisableActions(true)
+        campfireVisual?.root.isHidden = !Settings.shared.campfireOn || paused || expose
         for o in overlays { fadeClip(o) }
         CATransaction.commit()
+        updateRate()
     }
     func fadeClip(_ o: Overlay) {
         let to: Float = expose ? 0 : 1
@@ -1379,6 +1726,7 @@ final class Engine {
         updateFlakes(dt: dt, now: now)
         updateSpills(dt: dt)
         updateWaterDrops(dt: dt)
+        updateCampfire(dt: dt, now: now)
         if tickCount % 10 == 0 { for p in piles.values where p.mean > 0.05 { p.relax() }; pileDirty = true }
         if virtualNow == nil, now - lastSave > 30 { saveState() }
         if tickCount % 120 == 0 {
@@ -1390,22 +1738,31 @@ final class Engine {
         updatePlows(dt: dt, now: now)
         updateProps(dt: dt)
         updateRoll()
-        // pile paths: immediately when windows move, otherwise at most ~4 Hz for slow growth
-        if geometryChanged || (pileDirty && now - lastPileDraw > 0.4) {   // moves: cheap re-position
+        // pile paths: immediately when windows move, ~20 Hz while campfire melts, otherwise ~2.5 Hz
+        let pileInterval: CFTimeInterval = campfireMelting ? 0.05 : 0.4
+        if geometryChanged || (pileDirty && now - lastPileDraw > pileInterval) {   // moves: cheap re-position
             redrawPiles(); pileDirty = false; geometryChanged = false; lastPileDraw = now
         }
         CATransaction.commit()
         updateRate()
     }
 
-    func updateWindMonitor() {
-        let need = Settings.shared.windOn || Settings.shared.meltOn
-        if let monitor = windMonitor, !need {
-            NSEvent.removeMonitor(monitor); windMonitor = nil; windPoint = nil
-        } else if need, windMonitor == nil {
-            windMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
-                self?.mouseWind(at: NSEvent.mouseLocation)
-            }
+    func updateMouseMoveMonitor() {
+        var want: NSEvent.EventTypeMask = []
+        if Settings.shared.windOn || Settings.shared.meltOn || Settings.shared.campfireOn { want.insert(.mouseMoved) }
+        if Settings.shared.campfireOn { want.insert(.rightMouseDragged) }
+        if want == mouseMoveMask { return }
+        if let monitor = mouseMoveMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseMoveMonitor = nil
+        }
+        mouseMoveMask = want
+        if !Settings.shared.windOn && !Settings.shared.meltOn { windPoint = nil }
+        guard !want.isEmpty else { return }
+        mouseMoveMonitor = NSEvent.addGlobalMonitorForEvents(matching: want) { [weak self] ev in
+            let p = NSEvent.mouseLocation
+            if ev.type == .mouseMoved { self?.mouseWind(at: p) }
+            if Settings.shared.campfireOn { self?.updateCampfirePointer(at: p) }
         }
     }
 
@@ -2457,7 +2814,7 @@ final class Engine {
     /// mouse down: arm a roll if the press is on a visible pile band of a still window.
     func rollBegin(at p: CGPoint) {
         roll = nil
-        guard Settings.shared.snowmenOn else { return }
+        guard Settings.shared.snowmenOn, !Settings.shared.campfireOn else { return }
         let cands = surfaces.values.filter { s in
             guard p.x >= s.minX + 4, p.x <= s.maxX - 4, isVisible(s.key, p.x) else { return false }
             let h = piles[s.key]?.height(at: p.x - s.minX) ?? 0
@@ -2589,6 +2946,439 @@ final class Engine {
         }
     }
 
+    // MARK: campfire
+
+    func updateCampfirePointer(at p: CGPoint) {
+        guard Settings.shared.campfireOn, p.x.isFinite, p.y.isFinite else { return }
+        campfirePoint = p
+        guard !paused, !expose, !overlays.isEmpty, let vis = campfireVisual else { return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        let o = overlays[overlayIndex(for: p)]
+        if vis.parent !== o.actors {
+            vis.root.removeFromSuperlayer()
+            o.actors.addSublayer(vis.root)
+            vis.parent = o.actors
+        }
+        vis.root.isHidden = false
+        vis.root.position = o.local(p)
+        CATransaction.commit()
+    }
+
+    func updateCampfire(dt: CGFloat, now: CFTimeInterval) {
+        updateCampfireSparks(dt: dt)
+        updateMeltDrops(dt: dt)
+        updateCampfireSteams(dt: dt)
+
+        campfireMelting = false
+        let active = Settings.shared.campfireOn && !paused && !expose && !overlays.isEmpty
+        if !active {
+            campfireVisual?.root.isHidden = true
+            campfireVel = .zero
+            campfireLastPoint = nil
+            return
+        }
+        if virtualNow == nil {
+            campfirePoint = NSEvent.mouseLocation
+        }
+        guard let p = campfirePoint, p.x.isFinite, p.y.isFinite else {
+            campfireVisual?.root.isHidden = true
+            return
+        }
+
+        if let prev = campfireLastPoint, dt > 0.001 {
+            let raw = CGPoint(x: (p.x - prev.x) / dt, y: (p.y - prev.y) / dt)
+            let alpha = min(1, dt * 14)
+            campfireVel = CGPoint(x: campfireVel.x + (raw.x - campfireVel.x) * alpha,
+                                  y: campfireVel.y + (raw.y - campfireVel.y) * alpha)
+        } else {
+            campfireVel = .zero
+        }
+        campfireLastPoint = p
+
+        let vis = campfireVisual ?? CampfireVisual()
+        campfireVisual = vis
+        let o = overlays[overlayIndex(for: p)]
+        if vis.parent !== o.actors {
+            vis.root.removeFromSuperlayer()
+            o.actors.addSublayer(vis.root)
+            vis.parent = o.actors
+        }
+        vis.root.isHidden = false
+        vis.root.position = o.local(p)
+        campfirePhase += dt
+        vis.update(phase: campfirePhase, velocity: campfireVel)
+
+        // Rising ember sparks (capped at 25)
+        sparkDebt += (lowPower ? 7 : 12) * dt
+        while sparkDebt >= 1 {
+            sparkDebt -= 1
+            if campfireSparks.count >= 25 { sparkDebt = 0; break }
+            spawnCampfireSpark(near: p, velocity: campfireVel)
+        }
+
+        // Heat melting within radius ~68 * S
+        let radius = 68 * S
+        let dropThreshold = 6.0 * S * S
+
+        // 1) Snow piles & icicles
+        for (key, surf) in surfaces {
+            guard p.x >= surf.minX - radius, p.x <= surf.maxX + radius else { continue }
+            guard let pile = piles[key], !pile.heights.isEmpty else { continue }
+
+            if p.y >= surf.top - radius, p.y <= surf.top + Pile.maxH + radius {
+                let firstBin = max(0, Int((p.x - radius - surf.minX) / Pile.step))
+                let lastBin = min(pile.heights.count - 1, Int((p.x + radius - surf.minX) / Pile.step))
+                if firstBin <= lastBin {
+                    var surfMelted: CGFloat = 0
+                    var spots: [CGFloat] = []
+                    for i in firstBin...lastBin {
+                        let h = pile.heights[i]
+                        guard h > 0.01 else { continue }
+                        let gx = surf.minX + min(surf.width, CGFloat(i) * Pile.step)
+                        guard isVisible(key, gx) else { continue }
+                        let dist = hypot(gx - p.x, (surf.top + h * 0.5) - p.y)
+                        guard dist < radius else { continue }
+                        let intensity = pow(1 - dist / radius, 1.4)
+                        let melted = min(h, 11.5 * S * intensity * dt)
+                        let nextH = h - melted
+                        pile.heights[i] = nextH < 0.02 ? 0 : nextH
+                        surfMelted += melted * Pile.step
+                        spots.append(gx)
+                    }
+                    if surfMelted > 0 {
+                        pile.dirty = true; pileDirty = true; campfireMelting = true
+                        meltWaterDebt += surfMelted
+                        while meltWaterDebt >= dropThreshold {
+                            meltWaterDebt -= dropThreshold
+                            let dropX = (spots.randomElement() ?? p.x) + .random(in: -2...2) * S
+                            spawnMeltDrop(at: CGPoint(x: dropX, y: surf.top - 1 * S),
+                                          source: key, fromDock: surf.z < 0,
+                                          cling: .random(in: 0.14...0.30))
+                        }
+                        if now - lastSteam >= 0.14, let sx = spots.randomElement() {
+                            lastSteam = now
+                            spawnCampfireSteam(at: CGPoint(x: sx, y: surf.top + 3 * S))
+                        }
+                    }
+                }
+            }
+
+            // 2) Visible icicles
+            if Settings.shared.meltOn, surf.z >= 0,
+               p.y >= surf.top - 40 * S - radius, p.y <= surf.top + radius,
+               pile.icicles.contains(where: { $0.length > 0 }) {
+                for i in pile.icicles.indices {
+                    let site = pile.icicles[i]
+                    guard site.length > 0, site.x < surf.width - 12 * S else { continue }
+                    let gx = surf.minX + site.x
+                    guard isVisible(key, gx) else { continue }
+                    let tipY = surf.top - site.length
+                    let midY = surf.top - site.length * 0.5
+                    let dist = min(hypot(gx - p.x, tipY - p.y), hypot(gx - p.x, midY - p.y))
+                    guard dist < radius else { continue }
+                    let intensity = pow(1 - dist / radius, 1.4)
+                    let shrink = min(site.length, 24 * S * intensity * dt)
+                    let nextLen = site.length - shrink
+                    pile.icicles[i].length = nextLen < 0.8 ? 0 : nextLen
+                    pile.icicleDirty = true; pileDirty = true; campfireMelting = true
+                    meltWaterDebt += shrink * 2.2 * S
+                    while meltWaterDebt >= dropThreshold {
+                        meltWaterDebt -= dropThreshold
+                        spawnMeltDrop(at: CGPoint(x: gx, y: surf.top - pile.icicles[i].length),
+                                      source: key, fromDock: false,
+                                      cling: .random(in: 0.04...0.10))
+                    }
+                }
+            }
+        }
+
+        // 3) Snowmen & snowballs
+        if !props.isEmpty {
+            var propMelted = false
+            props.removeAll { m in
+                if m.layer.isHidden { return false }
+                if let c = carry, c.active, c.prop === m { return false }
+                let cx = min(max(p.x, m.pos.x - m.halfWidth), m.pos.x + m.halfWidth)
+                let cy = min(max(p.y, m.pos.y), m.pos.y + m.height)
+                let dist = hypot(p.x - cx, p.y - cy)
+                guard dist < radius else { return false }
+                let intensity = pow(1 - dist / radius, 1.4)
+                campfireMelting = true
+                let shrink = (m.kind == .snowman ? 0.38 * S : 3.6 * S) * intensity * dt
+                m.scale -= shrink
+                let minScale = m.kind == .snowman ? 0.38 * S : 2.5 * S
+                let source = m.host ?? 0
+                let fromDock = source >= Engine.dockKey(0)
+                if m.scale < minScale {
+                    let basePos = m.pos
+                    let halfW = m.halfWidth
+                    let splashCount = m.kind == .snowman ? 10 : 6
+                    let trickleCount = m.kind == .snowman ? 6 : 4
+                    m.remove()
+                    spawnWaterSplash(at: CGPoint(x: basePos.x, y: basePos.y + 2 * S), count: splashCount)
+                    for _ in 0..<trickleCount {
+                        spawnMeltDrop(at: CGPoint(x: basePos.x + .random(in: -halfW...halfW) * 0.8, y: basePos.y),
+                                      source: source, fromDock: fromDock,
+                                      cling: .random(in: 0.08...0.22))
+                    }
+                    propMelted = true
+                    return true
+                }
+                let k = m.kind == .snowman ? m.scale : m.scale / 20
+                m.layer.setAffineTransform(CGAffineTransform(scaleX: k, y: k))
+                if let d = m.deco {
+                    let dk = min(S, m.scale)
+                    d.setAffineTransform(CGAffineTransform(scaleX: dk, y: dk))
+                }
+                place(m)
+                meltWaterDebt += (m.kind == .snowman ? shrink * 28 * S : shrink * 3.2 * S)
+                while meltWaterDebt >= dropThreshold {
+                    meltWaterDebt -= dropThreshold
+                    spawnMeltDrop(at: CGPoint(x: m.pos.x + .random(in: -m.halfWidth...m.halfWidth) * 0.6, y: m.pos.y),
+                                  source: source, fromDock: fromDock,
+                                  cling: .random(in: 0.12...0.26))
+                }
+                if now - lastSteam >= 0.16 {
+                    lastSteam = now
+                    spawnCampfireSteam(at: CGPoint(x: m.pos.x, y: m.pos.y + m.height * 0.65))
+                }
+                return false
+            }
+            if propMelted { saveState() }
+        }
+    }
+
+    private func meltDropLayer(splash: Bool) -> CALayer {
+        let l = meltDropPool.popLast() ?? {
+            let layer = CALayer()
+            layer.zPosition = 50
+            layer.contentsGravity = .resize
+            return layer
+        }()
+        l.contents = splash ? CampfireAssets.splashImage : CampfireAssets.dropImage
+        l.opacity = 1
+        l.setAffineTransform(.identity)
+        return l
+    }
+
+    private func recycleMeltDrop(_ layer: CALayer) {
+        layer.removeFromSuperlayer()
+        layer.opacity = 1
+        meltDropPool.append(layer)
+    }
+
+    func spawnMeltDrop(at pos: CGPoint, source: UInt64, fromDock: Bool, cling: CGFloat) {
+        guard !overlays.isEmpty, meltDrops.count < 140 else { return }
+        let layer = meltDropLayer(splash: false)
+        let w = CGFloat.random(in: 3.4...5.2) * S
+        let h = w * 1.45
+        layer.bounds = CGRect(x: 0, y: 0, width: w, height: h)
+        let o = overlays[overlayIndex(for: pos)]
+        o.actors.addSublayer(layer)
+        layer.position = o.local(pos)
+        meltDrops.append(MeltDrop(
+            layer: layer, pos: pos,
+            vx: .random(in: -10...10) * S,
+            vy: .random(in: -18 ... -6) * S,
+            width: w, cling: cling,
+            source: source, fromDock: fromDock,
+            isSplash: false, ttl: .infinity, maxTTL: 1
+        ))
+    }
+
+    func spawnWaterSplash(at pos: CGPoint, count: Int) {
+        guard !overlays.isEmpty else { return }
+        for _ in 0..<count {
+            guard meltDrops.count < 140 else { break }
+            let layer = meltDropLayer(splash: true)
+            let d = CGFloat.random(in: 2.4...4.0) * S
+            layer.bounds = CGRect(x: 0, y: 0, width: d, height: d)
+            let o = overlays[overlayIndex(for: pos)]
+            o.actors.addSublayer(layer)
+            layer.position = o.local(pos)
+            let ttl = CGFloat.random(in: 0.22...0.42)
+            meltDrops.append(MeltDrop(
+                layer: layer, pos: pos,
+                vx: .random(in: -88...88) * S,
+                vy: .random(in: 55...135) * S,
+                width: d, cling: 0,
+                source: 0, fromDock: true,
+                isSplash: true, ttl: ttl, maxTTL: ttl
+            ))
+        }
+    }
+
+    func updateMeltDrops(dt: CGFloat) {
+        guard !meltDrops.isEmpty else { return }
+        let bottom = (overlays.map { $0.frame.minY }.min() ?? 0) - 24 * S
+        var kept: [MeltDrop] = []
+        kept.reserveCapacity(meltDrops.count)
+        var splashes: [CGPoint] = []
+        for var d in meltDrops {
+            let oldY = d.pos.y
+            if d.isSplash {
+                d.vy -= 520 * S * dt
+                d.vx *= 1 - min(1, 2.5 * dt)
+                d.pos.x += d.vx * dt
+                d.pos.y += d.vy * dt
+                d.ttl -= dt
+                d.layer.opacity = Float(max(0, min(1, d.ttl / max(0.05, d.maxTTL * 0.65))))
+                if d.ttl <= 0 || d.pos.y < bottom {
+                    recycleMeltDrop(d.layer)
+                    continue
+                }
+            } else {
+                if d.cling > 0 {
+                    d.cling -= dt
+                    d.vy = max(-55 * S, d.vy - 95 * S * dt)
+                    d.vx *= 1 - min(1, 5 * dt)
+                } else {
+                    d.vy = max(-540 * S, d.vy - 640 * S * dt)
+                    d.vx *= 1 - min(1, 1.2 * dt)
+                }
+                d.pos.x += d.vx * dt
+                d.pos.y += d.vy * dt
+                let stretch = min(4.2, 1.35 + abs(d.vy) / (115 * S))
+                d.layer.bounds = CGRect(x: 0, y: 0, width: d.width, height: d.width * stretch)
+
+                if !d.fromDock, d.pos.y < oldY,
+                   let target = landingSurface(at: d.pos.x, below: oldY, above: d.pos.y, excluding: d.source) {
+                    let hitY = target.top + (piles[target.key]?.height(at: d.pos.x - target.minX) ?? 0) * 0.45 + 1
+                    splashes.append(CGPoint(x: d.pos.x, y: hitY))
+                    recycleMeltDrop(d.layer)
+                    continue
+                }
+                if d.pos.y < bottom {
+                    recycleMeltDrop(d.layer)
+                    continue
+                }
+            }
+            let o = overlays[overlayIndex(for: d.pos)]
+            if d.layer.superlayer !== o.actors { o.actors.addSublayer(d.layer) }
+            d.layer.position = o.local(d.pos)
+            kept.append(d)
+        }
+        meltDrops = kept
+        for pt in splashes {
+            spawnWaterSplash(at: pt, count: Int.random(in: 3...4))
+        }
+    }
+
+    func spawnCampfireSpark(near p: CGPoint, velocity: CGPoint) {
+        guard !overlays.isEmpty, campfireSparks.count < 25 else { return }
+        let layer = sparkPool.popLast() ?? {
+            let l = CALayer()
+            l.zPosition = 1001
+            l.shadowColor = NSColor(calibratedRed: 1, green: 0.55, blue: 0.08, alpha: 1).cgColor
+            l.shadowOpacity = 0.8
+            l.shadowRadius = 2.5
+            l.shadowOffset = .zero
+            return l
+        }()
+        let r = CGFloat.random(in: 0.9...1.9) * S
+        let hot = Bool.random()
+        layer.backgroundColor = (hot
+            ? NSColor(calibratedRed: 1.0, green: 0.86, blue: 0.28, alpha: 1)
+            : NSColor(calibratedRed: 1.0, green: 0.46, blue: 0.08, alpha: 1)).cgColor
+        layer.bounds = CGRect(x: 0, y: 0, width: 2 * r, height: 2 * r)
+        layer.cornerRadius = r
+        layer.opacity = 1
+        layer.setAffineTransform(.identity)
+
+        let pos = CGPoint(x: p.x + .random(in: -7...7) * S, y: p.y + .random(in: -2...12) * S)
+        let o = overlays[overlayIndex(for: pos)]
+        o.actors.addSublayer(layer)
+        layer.position = o.local(pos)
+        let trailX = max(-90 * S, min(90 * S, -velocity.x * 0.12))
+        campfireSparks.append(CampfireSpark(
+            layer: layer, pos: pos,
+            vx: trailX + .random(in: -18...18) * S,
+            vy: .random(in: 28...68) * S,
+            age: 0, life: .random(in: 0.45...0.95),
+            phase: .random(in: 0...(2 * .pi))
+        ))
+    }
+
+    func updateCampfireSparks(dt: CGFloat) {
+        guard !campfireSparks.isEmpty else { return }
+        var kept: [CampfireSpark] = []
+        kept.reserveCapacity(campfireSparks.count)
+        for var sp in campfireSparks {
+            sp.age += dt
+            if sp.age >= sp.life {
+                sp.layer.removeFromSuperlayer()
+                sp.layer.opacity = 1
+                sparkPool.append(sp.layer)
+                continue
+            }
+            let u = sp.age / sp.life
+            sp.vx *= 1 - min(1, 1.8 * dt)
+            sp.pos.x += (sp.vx + sin(sp.phase + sp.age * 9) * 14 * S) * dt
+            sp.pos.y += sp.vy * dt
+            sp.layer.opacity = Float(max(0, (1 - u) * (1 - u * 0.3)))
+            let sc = max(0.35, 1 - u * 0.55)
+            sp.layer.setAffineTransform(CGAffineTransform(scaleX: sc, y: sc))
+            let o = overlays[overlayIndex(for: sp.pos)]
+            if sp.layer.superlayer !== o.actors { o.actors.addSublayer(sp.layer) }
+            sp.layer.position = o.local(sp.pos)
+            kept.append(sp)
+        }
+        campfireSparks = kept
+    }
+
+    func spawnCampfireSteam(at pos: CGPoint) {
+        guard !overlays.isEmpty, campfireSteams.count < 18 else { return }
+        let layer = steamPool.popLast() ?? {
+            let l = CALayer()
+            l.zPosition = 900
+            l.contents = CampfireAssets.steamImage
+            l.contentsGravity = .resize
+            return l
+        }()
+        let size = CGFloat.random(in: 12...19) * S
+        layer.bounds = CGRect(x: 0, y: 0, width: size, height: size)
+        layer.opacity = 0.01
+        layer.setAffineTransform(CGAffineTransform(scaleX: 0.75, y: 0.75))
+        let o = overlays[overlayIndex(for: pos)]
+        o.actors.addSublayer(layer)
+        layer.position = o.local(pos)
+        campfireSteams.append(CampfireSteam(
+            layer: layer, pos: pos,
+            vx: .random(in: -10...10) * S,
+            vy: .random(in: 22...40) * S,
+            age: 0, life: .random(in: 0.75...1.25),
+            baseSize: size
+        ))
+    }
+
+    func updateCampfireSteams(dt: CGFloat) {
+        guard !campfireSteams.isEmpty else { return }
+        var kept: [CampfireSteam] = []
+        kept.reserveCapacity(campfireSteams.count)
+        for var st in campfireSteams {
+            st.age += dt
+            if st.age >= st.life {
+                st.layer.removeFromSuperlayer()
+                st.layer.opacity = 1
+                steamPool.append(st.layer)
+                continue
+            }
+            let u = st.age / st.life
+            st.pos.x += (st.vx + sin(st.age * 4.5 + st.baseSize) * 6 * S) * dt
+            st.pos.y += st.vy * dt
+            let fadeIn = min(1, u / 0.2)
+            let fadeOut = max(0, 1 - max(0, u - 0.2) / 0.8)
+            st.layer.opacity = Float(0.28 * fadeIn * fadeOut)
+            let sc = 0.75 + u * 1.15
+            st.layer.setAffineTransform(CGAffineTransform(scaleX: sc, y: sc))
+            let o = overlays[overlayIndex(for: st.pos)]
+            if st.layer.superlayer !== o.actors { o.actors.addSublayer(st.layer) }
+            st.layer.position = o.local(st.pos)
+            kept.append(st)
+        }
+        campfireSteams = kept
+    }
+
     // MARK: mouse (global monitors; the overlay itself stays click-through)
 
     var downPoint: CGPoint?
@@ -2600,9 +3390,14 @@ final class Engine {
     func topWindow(at p: CGPoint, in list: [Win]) -> Win? { list.first { $0.frame.contains(p) }.flatMap { $0.surface ? $0 : nil } }
 
     func installMouseMonitors() {
-        updateWindMonitor()
+        updateMouseMoveMonitor()
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] _ in self?.mouseDown(at: NSEvent.mouseLocation) }
-        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] _ in self?.mouseDragged(to: NSEvent.mouseLocation); self?.mouseWind(at: NSEvent.mouseLocation) }
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] _ in
+            let p = NSEvent.mouseLocation
+            self?.mouseDragged(to: p)
+            self?.mouseWind(at: p)
+            if Settings.shared.campfireOn { self?.updateCampfirePointer(at: p) }
+        }
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in self?.mouseUp(at: NSEvent.mouseLocation) }
     }
 
@@ -2828,7 +3623,7 @@ final class Engine {
             if m.kind == .ball { jump(m) }
             return
         }
-        guard Settings.shared.snowmenOn, let w0 = downWin else { return }
+        guard Settings.shared.snowmenOn, !Settings.shared.campfireOn, let w0 = downWin else { return }
         refreshGeometry()
         guard let w1 = topWindow(at: p, in: wins), w1.id == w0.id, w1.frame == w0.frame else { return }
         guard p.y >= w1.frame.maxY - 28 else { return }        // title-bar strip only
@@ -2872,8 +3667,8 @@ final class Engine {
     func dump() {
         var out = "interval=\(interval) flakes=\(flakes.count) props=\(props.count) paused=\(paused)\n"
         let settings = Settings.shared
-        out += "settings intensity=\(settings.intensity.rawValue) wind=\(settings.windOn)/\(settings.windStrength) melt=\(settings.meltOn)/\(settings.meltSpeed) battery=\(settings.batteryMode.rawValue) lowPower=\(lowPower) onAC=\(onAC) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled) login=\(SMAppService.mainApp.status.rawValue)\n"
-        out += "wind gusts=\(windGusts) pushed=\(windPushed) dust=\(windDust)\n"
+        out += "settings intensity=\(settings.intensity.rawValue) wind=\(settings.windOn)/\(settings.windStrength) melt=\(settings.meltOn)/\(settings.meltSpeed) campfire=\(settings.campfireOn) battery=\(settings.batteryMode.rawValue) lowPower=\(lowPower) onAC=\(onAC) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled) login=\(SMAppService.mainApp.status.rawValue)\n"
+        out += "wind gusts=\(windGusts) pushed=\(windPushed) dust=\(windDust) campfireDrops=\(meltDrops.count) campfireSparks=\(campfireSparks.count)\n"
         out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1)\n"
         out += "shake on=\(settings.shakeOn) strength=\(settings.shakeStrength.rawValue) jolts=\(shakeJolts) sheds=\(shakeSheds) drags=\(dragCount)\n"
         for (k, p) in piles where k < Engine.dockKey(0) {
@@ -3030,6 +3825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         choices("눈 털기 강도 (Shake strength)", ShakeStrength.allCases.map { $0.title }, s.shakeStrength.rawValue, #selector(setShakeStrength(_:)))
         add("녹기·고드름 (Melting & icicles)", #selector(toggleMelt), on: s.meltOn)
         choices("녹는 속도 (Melt speed)", ["느리게 (Slow)", "보통 (Normal)", "빠르게 (Fast)"], s.meltSpeed, #selector(setMeltSpeed(_:)))
+        add("모닥불 모드 (Campfire mode)", #selector(toggleCampfire), on: s.campfireOn)
         choices("배터리 절약 (Battery saving)", BatteryMode.allCases.map { $0.title }, s.batteryMode.rawValue, #selector(setBatteryMode(_:)))
         add("로그인 시 자동 실행 (Launch at login)", #selector(toggleLogin), on: SMAppService.mainApp.status == .enabled)
         add("눈사람 (Snowmen) — 제목줄 클릭 / 눈 굴리기", #selector(toggleSnowmen), on: s.snowmenOn)
@@ -3049,12 +3845,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add("종료 (Quit)", #selector(quit), key: "q")
     }
 
-    @objc func toggleWind() { Settings.shared.windOn.toggle(); engine.updateWindMonitor() }
+    @objc func toggleWind() { Settings.shared.windOn.toggle(); engine.updateMouseMoveMonitor() }
     @objc func setWindStrength(_ i: NSMenuItem) { Settings.shared.windStrength = i.tag }
     @objc func toggleShake() { Settings.shared.shakeOn.toggle() }
     @objc func setShakeStrength(_ i: NSMenuItem) { Settings.shared.shakeStrength = ShakeStrength(rawValue: i.tag) ?? .normal }
     @objc func toggleMelt() { Settings.shared.meltOn.toggle(); engine.applySettings() }
     @objc func setMeltSpeed(_ i: NSMenuItem) { Settings.shared.meltSpeed = i.tag; engine.lastMelt = engine.clock() }
+    @objc func toggleCampfire() { Settings.shared.campfireOn.toggle(); engine.applySettings() }
     @objc func setBatteryMode(_ i: NSMenuItem) { Settings.shared.batteryMode = BatteryMode(rawValue: i.tag) ?? .auto; engine.updatePower() }
     @objc func toggleLogin() {
         let service = SMAppService.mainApp
@@ -3106,11 +3903,15 @@ if let i = CommandLine.arguments.firstIndex(of: "--showcase") {
 let delegate = AppDelegate()
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
-// Debug control channel (see notify.sh): plow, spawn, balls, jump, clear, fill, roll
+// Debug control channel (see notify.sh): plow, spawn, balls, jump, shake, campfire, clear, fill, roll
 for (name, action) in [("plow", { delegate.engine.startPlow() }),
                        ("melt.fast", {
                            delegate.engine.piles.values.forEach { $0.created = .distantPast }
                            delegate.engine.meltStep(seconds: 600)
+                       }),
+                       ("campfire", {
+                           Settings.shared.campfireOn.toggle()
+                           delegate.engine.applySettings()
                        }),
                        ("spawn", { delegate.engine.spawnDemoSnowmen() }),
                        ("balls", { delegate.engine.spawnDemoBalls() }),

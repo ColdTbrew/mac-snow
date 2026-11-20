@@ -29,7 +29,7 @@ enum Showcase {
 
     static func run(outDir: String) {
         // fixed settings for the run only (argument domain: never written to disk)
-        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "batteryMode": 2, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue],
+        UserDefaults.standard.setVolatileDomain(["snowOn": true, "intensity": 1, "snowmenOn": true, "autoPlow": false, "flakesOnTop": false, "windOn": true, "windStrength": 1, "meltOn": true, "meltSpeed": 1, "campfireOn": false, "batteryMode": 2, "shakeOn": true, "shakeStrength": ShakeStrength.normal.rawValue],
                                                 forName: UserDefaults.argumentDomain)
         S = 1.15
         dockRect = CGRect(x: 455, y: 6, width: 530, height: 64)
@@ -334,6 +334,41 @@ enum Showcase {
             }
             precondition(hitVerified)
             print("snowball throw: hit snowman, removed with puff particles")
+
+            // 14) Campfire cursor mode: hover over Music's snow to melt a trough into flowing water droplets.
+            engine.piles[2]?.fill()
+            engine.pileDirty = true
+            step(2)
+            let cfLocalX: CGFloat = 390
+            let beforeLocal = engine.piles[2]?.height(at: cfLocalX) ?? 0
+            let beforeMean = engine.piles[2]?.mean ?? 0
+            var cfSettings = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+            cfSettings["campfireOn"] = true
+            UserDefaults.standard.setVolatileDomain(cfSettings, forName: UserDefaults.argumentDomain)
+            engine.applySettings()
+            var maxDrops = 0
+            step(36) { i in
+                let k = CGFloat(i) / 35
+                engine.campfirePoint = CGPoint(x: surf.minX + 360 + 65 * k, y: surf.top + 10)
+                maxDrops = max(maxDrops, engine.meltDrops.count)
+                if i == 24 {
+                    still("still-campfire-zoom", scale: 3, crop: CGRect(x: surf.minX + 290, y: surf.top - 115, width: 240, height: 175))
+                }
+            }
+            maxDrops = max(maxDrops, engine.meltDrops.count)
+            let afterLocal = engine.piles[2]?.height(at: cfLocalX) ?? 0
+            let afterMean = engine.piles[2]?.mean ?? 0
+            precondition(beforeLocal > 5 && afterLocal < beforeLocal * 0.45,
+                         "campfire should melt local snow pile significantly: \(beforeLocal) -> \(afterLocal)")
+            precondition(afterMean < beforeMean * 0.9,
+                         "campfire should lower mean snow height: \(beforeMean) -> \(afterMean)")
+            precondition(maxDrops >= 5, "campfire should spawn flowing water droplets (got \(maxDrops))")
+            print("campfire: local \(String(format: "%.1f", beforeLocal)) -> \(String(format: "%.1f", afterLocal)), mean \(String(format: "%.2f", beforeMean)) -> \(String(format: "%.2f", afterMean)), maxDrops=\(maxDrops)")
+            cfSettings["campfireOn"] = false
+            UserDefaults.standard.setVolatileDomain(cfSettings, forName: UserDefaults.argumentDomain)
+            engine.applySettings()
+            engine.campfirePoint = nil
+            precondition(engine.campfireVisual?.root.isHidden == true, "campfire visual should hide when turned off")
         }
         print("showcase: \(frameNo) frames -> \(outDir)")
     }
