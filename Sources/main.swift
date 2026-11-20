@@ -248,6 +248,14 @@ enum DockGeometry {
 
 // MARK: - Snow pile height map
 
+struct Icicle {
+    let x: CGFloat
+    let cap: CGFloat
+    let girth: CGFloat
+    let lean: CGFloat
+    var length: CGFloat = 0
+}
+
 final class Pile {
     static let step: CGFloat = 3
     static let maxH: CGFloat = 13 * S
@@ -257,7 +265,8 @@ final class Pile {
     var caps: [CGFloat] = []
     var lastSeen = Date()
     var created = Date()
-    var icicles: [CGFloat] = []
+    var icicles: [Icicle] = []
+    var icicleLayoutWidth: CGFloat?
     var icicleDirty = true
     private let ph1 = CGFloat.random(in: 0...6.28), ph2 = CGFloat.random(in: 0...6.28)
     /// soft rounded lumps rather than a flat slab
@@ -1370,10 +1379,42 @@ final class Engine {
         updateRate()
     }
 
-    func icicleSite(_ key: UInt64, _ index: Int) -> (x: CGFloat, cap: CGFloat) {
-        let seed = (key &* 1664525 &+ UInt64(index) &* 1013904223) & 0xffff
-        let fraction = CGFloat(seed) / 65535
-        return ((25 + CGFloat(index) * 58 + fraction * 12) * S, (10 + fraction * 12) * S)
+    func layoutIcicles(on surf: Surface, pile: Pile) {
+        let width = surf.width / S
+        guard pile.icicleLayoutWidth != width else { return }
+        pile.icicleLayoutWidth = width
+        var seed = surf.key
+        func sample(_ range: ClosedRange<CGFloat>) -> CGFloat {
+            // SplitMix64 keeps the layout stable as the window moves or reveals more sites on resize.
+            seed &+= 0x9e3779b97f4a7c15
+            var value = seed
+            value = (value ^ (value >> 30)) &* 0xbf58476d1ce4e5b9
+            value = (value ^ (value >> 27)) &* 0x94d049bb133111eb
+            value ^= value >> 31
+            let fraction = CGFloat(value >> 40) / 16_777_216
+            return range.lowerBound + fraction * (range.upperBound - range.lowerBound)
+        }
+
+        var sites: [Icicle] = []
+        var x = sample(16...45)
+        let limit = width - 12
+        while x < limit {
+            let count = Int(sample(1...5))
+            let longest = Int(sample(0...CGFloat(count)))
+            for index in 0..<count {
+                guard x < limit else { break }
+                let cap = index == longest ? sample(11...27) : sample(3...13)
+                sites.append(Icicle(x: x * S, cap: cap * S, girth: sample(0.8...1.35),
+                                    lean: sample(-0.65...0.65)))
+                if index + 1 < count { x += sample(5...16) }
+            }
+            x += sample(27...96)
+        }
+        for index in 0..<min(sites.count, pile.icicles.count) {
+            sites[index].length = pile.icicles[index].length
+        }
+        pile.icicles = sites
+        pile.icicleDirty = true
     }
 
     /// Explicit calls also drive the debug and virtual-desktop melt scenes.
@@ -1381,28 +1422,24 @@ final class Engine {
         guard Settings.shared.meltOn, !paused, seconds > 0 else { return }
         let amount = [CGFloat(0.4), 1.2, 3.0][Settings.shared.meltSpeed] * S * CGFloat(seconds) / 60
         for (key, pile) in piles where Date().timeIntervalSince(pile.created) >= 180 {
-            guard pile.heights.contains(where: { $0 > 0 }) || pile.icicles.contains(where: { $0 > 0 }) else { continue }
+            guard pile.heights.contains(where: { $0 > 0 }) || pile.icicles.contains(where: { $0.length > 0 }) else { continue }
             let before = pile.heights
             for i in pile.heights.indices { pile.heights[i] = max(0, pile.heights[i] - amount) }
             pile.dirty = true; pileDirty = true
             guard key < Engine.dockKey(0), let surf = surfaces[key] else { continue }
-            let count = max(0, Int((surf.width / S - 25) / 58))
-            if pile.icicles.count != count {
-                pile.icicles = Array(pile.icicles.prefix(count))
-                while pile.icicles.count < count { pile.icicles.append(0) }
-                pile.icicleDirty = true
-            }
+            layoutIcicles(on: surf, pile: pile)
             let empty = !before.contains { $0 > 0.05 }
             for i in pile.icicles.indices {
-                let site = icicleSite(key, i), bin = min(before.count - 1, max(0, pile.index(site.x)))
+                let site = pile.icicles[i], bin = min(before.count - 1, pile.index(site.x))
                 guard bin >= 0 else { continue }
-                let old = pile.icicles[i]
+                let old = site.length
                 if empty {
-                    pile.icicles[i] = max(0, old - amount * 2)
+                    pile.icicles[i].length = max(0, old - amount * 2)
                 } else if before[bin] > 0, isVisible(key, surf.minX + site.x) {
-                    pile.icicles[i] = min(site.cap, old + (before[bin] - pile.heights[bin]) * 4)
+                    let growth = (before[bin] - pile.heights[bin]) * site.cap / (4 * S)
+                    pile.icicles[i].length = min(site.cap, old + growth)
                 }
-                if old != pile.icicles[i] { pile.icicleDirty = true }
+                if old != pile.icicles[i].length { pile.icicleDirty = true }
             }
         }
     }
@@ -1410,13 +1447,16 @@ final class Engine {
     func iciclePath(_ surf: Surface, _ pile: Pile) -> CGPath {
         let path = CGMutablePath()
         guard surf.z >= 0 else { return path }
-        for i in pile.icicles.indices where pile.icicles[i] > 0 {
-            let x = icicleSite(surf.key, i).x, length = pile.icicles[i]
+        for site in pile.icicles where site.length > 0 {
+            let x = site.x, length = site.length
             guard x < surf.width - 12 * S, isVisible(surf.key, surf.minX + x) else { continue }
-            let half = min(2.2 * S, length * 0.18)
+            let half = min(2.2 * S, length * 0.18) * site.girth
+            let tip = CGPoint(x: x + half * site.lean, y: -length)
             path.move(to: CGPoint(x: x - half, y: 0))
-            path.addLine(to: CGPoint(x: x, y: -length))
-            path.addLine(to: CGPoint(x: x + half, y: 0)); path.closeSubpath()
+            path.addQuadCurve(to: tip, control: CGPoint(x: tip.x - half * 0.4, y: -length * 0.65))
+            path.addQuadCurve(to: CGPoint(x: x + half, y: 0),
+                              control: CGPoint(x: tip.x + half * 0.5, y: -length * 0.55))
+            path.closeSubpath()
         }
         return path
     }
@@ -1540,11 +1580,16 @@ final class Engine {
         let area = m.kind == .snowman ? 0.3 * (13 * m.scale) * (50 * m.scale) : .pi * m.scale * m.scale
         piles[s.key]?.deposit(at: m.pos.x - s.minX, area: area)
         pileDirty = true
+        snowPuff(for: m, baseY: s.top, source: s.key)
+    }
+
+    private func snowPuff(for m: Prop, baseY: CGFloat, source: UInt64) {
+        guard !overlays.isEmpty else { return }
         let count = m.kind == .snowman ? 26 : 12
         let w = m.halfWidth, h = m.height * 0.7
         CATransaction.begin(); CATransaction.setDisableActions(true)
         for _ in 0..<count {
-            let pos = CGPoint(x: m.pos.x + .random(in: -w...w), y: s.top + .random(in: 0...h))
+            let pos = CGPoint(x: m.pos.x + .random(in: -w...w), y: baseY + .random(in: 0...h))
             let o = overlays[overlayIndex(for: pos)]
             let layer = flakeLayer()
             let r = CGFloat.random(in: 1.2...2.6) * S
@@ -1553,7 +1598,7 @@ final class Engine {
             o.actors.addSublayer(layer)
             let dir: CGFloat = pos.x < m.pos.x ? -1 : 1
             spills.append(Spill(layer: layer, pos: pos, vy: .random(in: 60...260) * S, vx: dir * .random(in: 30...170) * S,
-                                area: 0, source: s.key, fromDock: true, ttl: .random(in: 0.4...0.6)))
+                                area: 0, source: source, fromDock: true, ttl: .random(in: 0.4...0.6)))
         }
         CATransaction.commit()
         updateRate()
@@ -1695,7 +1740,7 @@ final class Engine {
         }
         for (k, surf) in surfaces {
             guard let pile = piles[k], pile.heights.count > 1 else { continue }
-            let empty = (pile.mean <= 0.05 && !pile.icicles.contains { $0 > 0 }) || (segments[k] ?? []).isEmpty
+            let empty = (pile.mean <= 0.05 && !pile.icicles.contains { $0.length > 0 }) || (segments[k] ?? []).isEmpty
             if empty { if let v = pileViews[k] { v.container.isHidden = true }; continue }
             let view = pileViews[k] ?? PileView()
             pileViews[k] = view
@@ -2077,6 +2122,7 @@ final class Engine {
     var downPoint: CGPoint?
     var downTime: CFTimeInterval = 0
     var downWin: Win?
+    weak var downSnowman: Prop?
 
     func topWindow(at p: CGPoint, in list: [Win]) -> Win? { list.first { $0.frame.contains(p) }.flatMap { $0.surface ? $0 : nil } }
 
@@ -2089,6 +2135,7 @@ final class Engine {
 
     func mouseDown(at p: CGPoint) {
         carryCancel(); carry = nil
+        downSnowman = nil
         mouseIsDown = true
         refreshGeometry()
         if expose { downPoint = nil; downWin = nil; drag = nil; rollCancel(); return }   // Mission Control clicks
@@ -2105,6 +2152,9 @@ final class Engine {
         if let m = prop(at: p, ballsOnly: true), let key = m.host, surfaces[key] != nil {
             rollCancel()
             carry = Carry(prop: m, host: key, at: p, time: clock())
+        } else if let m = prop(at: p), m.kind == .snowman {
+            rollCancel()
+            downSnowman = m
         } else { rollBegin(at: p) }
         CATransaction.commit()
         updateRate()
@@ -2195,9 +2245,12 @@ final class Engine {
             let x = surf.minX + min(surf.width, CGFloat(i) * Pile.step)
             samples.append((x: x, y: surf.top + h - t / 2, area: t * Pile.step))
         }
-        if pile.icicles.contains(where: { $0 > 0 }) {        // icicles snap off with it
+        if pile.icicles.contains(where: { $0.length > 0 }) {        // icicles snap off with it
             let keep = 1 - min(1, f * 1.5)
-            pile.icicles = pile.icicles.map { $0 * keep < 1 ? 0 : $0 * keep }
+            for index in pile.icicles.indices {
+                let length = pile.icicles[index].length * keep
+                pile.icicles[index].length = length < 1 ? 0 : length
+            }
             pile.icicleDirty = true
         }
         pile.dirty = true; pileDirty = true
@@ -2235,8 +2288,9 @@ final class Engine {
 
     func mouseUp(at p: CGPoint) {
         mouseIsDown = false
-        defer { updateRate() }
-        if drag?.confirmed == true {
+        defer { downSnowman = nil; updateRate() }
+        let draggedWindow = drag?.confirmed == true
+        if draggedWindow {
             carryCancel()
             drag = nil
             // final word from the window list (it may have snapped / tiled)
@@ -2266,7 +2320,18 @@ final class Engine {
         guard !rolled, let d = downPoint else { downPoint = nil; return }
         downPoint = nil
         guard hypot(p.x - d.x, p.y - d.y) < 4, clock() - downTime < 0.6 else { return }
-        if let m = prop(at: p) { jump(m); return }
+        if let m = downSnowman {
+            guard !draggedWindow, prop(at: p) === m else { return }
+            props.removeAll { $0 === m }
+            m.remove()
+            snowPuff(for: m, baseY: m.pos.y, source: m.host ?? 0)
+            saveState()
+            return
+        }
+        if let m = prop(at: p) {
+            if m.kind == .ball { jump(m) }
+            return
+        }
         guard Settings.shared.snowmenOn, let w0 = downWin else { return }
         refreshGeometry()
         guard let w1 = topWindow(at: p, in: wins), w1.id == w0.id, w1.frame == w0.frame else { return }
@@ -2316,7 +2381,7 @@ final class Engine {
         out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1)\n"
         out += "shake on=\(settings.shakeOn) strength=\(settings.shakeStrength.rawValue) jolts=\(shakeJolts) sheds=\(shakeSheds) drags=\(dragCount)\n"
         for (k, p) in piles where k < Engine.dockKey(0) {
-            let lengths = p.icicles.filter { $0 > 0 }
+            let lengths = p.icicles.map(\.length).filter { $0 > 0 }
             if let longest = lengths.max() { out += "icicles key=\(k) n=\(lengths.count) maxLen=\(longest)\n" }
         }
         out += "axTrusted=\(AXIsProcessTrusted()) dockAX=\(DockGeometry.debugAXFrame.map { "\(Int($0.minX))..\(Int($0.maxX)) top=\(Int($0.maxY))" } ?? "nil")\n"
