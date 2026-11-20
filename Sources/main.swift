@@ -393,8 +393,44 @@ func shape(_ p: CGPath, fill: NSColor, stroke: NSColor? = nil, lw: CGFloat = 0) 
 let snowEdge = NSColor(calibratedRed: 0.74, green: 0.81, blue: 0.92, alpha: 1)
 let santaRed = NSColor(calibratedRed: 0.86, green: 0.1, blue: 0.12, alpha: 1)
 
-/// Snowman with Santa hat and scarf, drawn at unit scale (base radius 9). Anchor = bottom centre.
-func makeSnowmanLayer() -> CALayer {
+struct SnowmanStyle: Codable, Equatable {
+    enum Hat: Int, CaseIterable, Codable {
+        case santa = 0, beanie, bucket, tophat
+    }
+    enum ScarfColor: Int, CaseIterable, Codable {
+        case red = 0, pine, cobalt, gold, plum, coral
+        var color: NSColor {
+            switch self {
+            case .red:    return santaRed
+            case .pine:   return NSColor(calibratedRed: 0.14, green: 0.56, blue: 0.34, alpha: 1)
+            case .cobalt: return NSColor(calibratedRed: 0.18, green: 0.45, blue: 0.85, alpha: 1)
+            case .gold:   return NSColor(calibratedRed: 0.92, green: 0.68, blue: 0.14, alpha: 1)
+            case .plum:   return NSColor(calibratedRed: 0.58, green: 0.24, blue: 0.68, alpha: 1)
+            case .coral:  return NSColor(calibratedRed: 0.94, green: 0.38, blue: 0.28, alpha: 1)
+            }
+        }
+        var stripe: NSColor {
+            switch self {
+            case .red:    return NSColor(calibratedRed: 1, green: 0.88, blue: 0.88, alpha: 0.9)
+            case .pine:   return NSColor(calibratedRed: 0.96, green: 0.94, blue: 0.82, alpha: 0.9)
+            case .cobalt: return NSColor(calibratedRed: 0.82, green: 0.93, blue: 1, alpha: 0.9)
+            case .gold:   return NSColor(calibratedRed: 0.48, green: 0.25, blue: 0.1, alpha: 0.85)
+            case .plum:   return NSColor(calibratedRed: 0.96, green: 0.84, blue: 1, alpha: 0.9)
+            case .coral:  return NSColor(calibratedRed: 1, green: 0.93, blue: 0.8, alpha: 0.9)
+            }
+        }
+    }
+    let hat: Hat
+    let scarf: ScarfColor
+
+    static func random() -> SnowmanStyle {
+        SnowmanStyle(hat: Hat.allCases.randomElement() ?? .santa,
+                     scarf: ScarfColor.allCases.randomElement() ?? .red)
+    }
+}
+
+/// Snowman with randomized winter hat and scarf, drawn at unit scale (base radius 9). Anchor = bottom centre.
+func makeSnowmanLayer(style: SnowmanStyle = .random()) -> CALayer {
     let root = CALayer()
     root.bounds = CGRect(x: 0, y: 0, width: 40, height: 52)
     root.anchorPoint = CGPoint(x: 0.5, y: 0)
@@ -412,19 +448,70 @@ func makeSnowmanLayer() -> CALayer {
     let scarf = CGMutablePath()
     scarf.addRoundedRect(in: CGRect(x: 14, y: 27, width: 12, height: 3), cornerWidth: 1.4, cornerHeight: 1.4)
     scarf.addRoundedRect(in: CGRect(x: 22, y: 19.5, width: 3, height: 9), cornerWidth: 1.2, cornerHeight: 1.2)
-    root.addSublayer(shape(scarf, fill: santaRed))
+    root.addSublayer(shape(scarf, fill: style.scarf.color))
+    let stripes = CGMutablePath()
+    stripes.addRect(CGRect(x: 22.2, y: 21.0, width: 2.6, height: 1.0))
+    stripes.addRect(CGRect(x: 22.2, y: 23.2, width: 2.6, height: 1.0))
+    root.addSublayer(shape(stripes, fill: style.scarf.stripe))
     root.addSublayer(shape(circle(CGPoint(x: 18, y: 35), 0.8), fill: .black))
     root.addSublayer(shape(circle(CGPoint(x: 22, y: 35), 0.8), fill: .black))
     let nose = CGMutablePath()
     nose.move(to: CGPoint(x: 20, y: 33.7)); nose.addLine(to: CGPoint(x: 25, y: 32.6)); nose.addLine(to: CGPoint(x: 20, y: 32.4)); nose.closeSubpath()
     root.addSublayer(shape(nose, fill: NSColor(calibratedRed: 1, green: 0.5, blue: 0.1, alpha: 1)))
-    let hat = CGMutablePath()
-    hat.move(to: CGPoint(x: 15, y: 38)); hat.addQuadCurve(to: CGPoint(x: 27, y: 46), control: CGPoint(x: 19, y: 48))
-    hat.addQuadCurve(to: CGPoint(x: 25, y: 38), control: CGPoint(x: 24, y: 42)); hat.closeSubpath()
-    root.addSublayer(shape(hat, fill: santaRed))
-    let brim = CGMutablePath(); brim.addRoundedRect(in: CGRect(x: 14, y: 36.6, width: 12, height: 3), cornerWidth: 1.5, cornerHeight: 1.5)
-    root.addSublayer(shape(brim, fill: .white, stroke: snowEdge, lw: 0.5))
-    root.addSublayer(shape(circle(CGPoint(x: 27.2, y: 45.6), 1.9), fill: .white, stroke: snowEdge, lw: 0.5))
+    switch style.hat {
+    case .santa:
+        let hat = CGMutablePath()
+        hat.move(to: CGPoint(x: 15, y: 38)); hat.addQuadCurve(to: CGPoint(x: 27, y: 46), control: CGPoint(x: 19, y: 48))
+        hat.addQuadCurve(to: CGPoint(x: 25, y: 38), control: CGPoint(x: 24, y: 42)); hat.closeSubpath()
+        root.addSublayer(shape(hat, fill: santaRed))
+        let brim = CGMutablePath(); brim.addRoundedRect(in: CGRect(x: 14, y: 36.6, width: 12, height: 3), cornerWidth: 1.5, cornerHeight: 1.5)
+        root.addSublayer(shape(brim, fill: .white, stroke: snowEdge, lw: 0.5))
+        root.addSublayer(shape(circle(CGPoint(x: 27.2, y: 45.6), 1.9), fill: .white, stroke: snowEdge, lw: 0.5))
+    case .beanie:
+        let dome = CGMutablePath()
+        dome.move(to: CGPoint(x: 14.4, y: 37.8))
+        dome.addQuadCurve(to: CGPoint(x: 20, y: 45.4), control: CGPoint(x: 14.8, y: 44.8))
+        dome.addQuadCurve(to: CGPoint(x: 25.6, y: 37.8), control: CGPoint(x: 25.2, y: 44.8))
+        dome.closeSubpath()
+        root.addSublayer(shape(dome, fill: style.scarf.color))
+        let band = CGMutablePath()
+        band.addRoundedRect(in: CGRect(x: 13.8, y: 36.5, width: 12.4, height: 3.1), cornerWidth: 1.4, cornerHeight: 1.4)
+        root.addSublayer(shape(band, fill: style.scarf.stripe, stroke: style.scarf.color.withAlphaComponent(0.45), lw: 0.5))
+        root.addSublayer(shape(circle(CGPoint(x: 20, y: 46.2), 2.2), fill: .white, stroke: snowEdge, lw: 0.5))
+    case .bucket:
+        let tin = NSColor(calibratedRed: 0.50, green: 0.64, blue: 0.78, alpha: 1)
+        let tinDark = NSColor(calibratedRed: 0.30, green: 0.42, blue: 0.56, alpha: 1)
+        let bucket = CGMutablePath()
+        bucket.move(to: CGPoint(x: 14.2, y: 37.4))
+        bucket.addLine(to: CGPoint(x: 16.4, y: 46.4))
+        bucket.addLine(to: CGPoint(x: 24.4, y: 45.3))
+        bucket.addLine(to: CGPoint(x: 25.6, y: 36.9))
+        bucket.closeSubpath()
+        root.addSublayer(shape(bucket, fill: tin, stroke: tinDark, lw: 0.6))
+        let rim = CGMutablePath()
+        rim.move(to: CGPoint(x: 13.4, y: 37.6)); rim.addLine(to: CGPoint(x: 26.2, y: 36.8))
+        root.addSublayer(shape(rim, fill: .clear, stroke: tinDark, lw: 1.5))
+        let handle = CGMutablePath()
+        handle.move(to: CGPoint(x: 15.0, y: 39.2))
+        handle.addQuadCurve(to: CGPoint(x: 25.2, y: 38.6), control: CGPoint(x: 20.5, y: 34.4))
+        root.addSublayer(shape(handle, fill: .clear, stroke: NSColor(calibratedWhite: 0.35, alpha: 0.9), lw: 0.7))
+    case .tophat:
+        let felt = NSColor(calibratedWhite: 0.16, alpha: 1)
+        let feltEdge = NSColor(calibratedWhite: 0.34, alpha: 1)
+        let crown = CGMutablePath()
+        crown.move(to: CGPoint(x: 15.4, y: 38.6))
+        crown.addLine(to: CGPoint(x: 14.6, y: 47.4))
+        crown.addLine(to: CGPoint(x: 25.4, y: 47.4))
+        crown.addLine(to: CGPoint(x: 24.6, y: 38.6))
+        crown.closeSubpath()
+        root.addSublayer(shape(crown, fill: felt, stroke: feltEdge, lw: 0.5))
+        let ribbon = CGMutablePath()
+        ribbon.addRect(CGRect(x: 15.2, y: 39.0, width: 9.6, height: 2.1))
+        root.addSublayer(shape(ribbon, fill: style.scarf.color))
+        let brim = CGMutablePath()
+        brim.addRoundedRect(in: CGRect(x: 12.2, y: 37.0, width: 15.6, height: 2.2), cornerWidth: 1.1, cornerHeight: 1.1)
+        root.addSublayer(shape(brim, fill: felt, stroke: feltEdge, lw: 0.4))
+    }
     root.shadowColor = NSColor(calibratedRed: 0.2, green: 0.25, blue: 0.4, alpha: 1).cgColor
     root.shadowOpacity = 0.35; root.shadowRadius = 1.5; root.shadowOffset = CGSize(width: 0, height: -1)
     return root
@@ -660,6 +747,7 @@ struct Spill {
 final class Prop {
     enum Kind { case snowman, ball }
     let kind: Kind
+    let style: SnowmanStyle?
     let layer: CALayer
     let deco: CALayer?
     var scale: CGFloat
@@ -672,9 +760,16 @@ final class Prop {
     let decoSide: CGFloat = Bool.random() ? 1 : -1
     weak var parent: CALayer?
 
-    init(kind: Kind, scale: CGFloat, withBalls: Bool = false) {
+    init(kind: Kind, scale: CGFloat, withBalls: Bool = false, style: SnowmanStyle? = nil) {
         self.kind = kind; self.scale = scale
-        layer = kind == .snowman ? makeSnowmanLayer() : makeBallLayer()
+        if kind == .snowman {
+            let chosen = style ?? SnowmanStyle.random()
+            self.style = chosen
+            layer = makeSnowmanLayer(style: chosen)
+        } else {
+            self.style = nil
+            layer = makeBallLayer()
+        }
         deco = withBalls ? makeSnowballsLayer() : nil
         let k = kind == .snowman ? scale : scale / 20
         layer.setAffineTransform(CGAffineTransform(scaleX: k, y: k))
@@ -846,7 +941,7 @@ final class Engine {
     // MARK: saved state (snow survives quitting / relaunching / updating the app)
 
     struct SavedPile: Codable { var key: UInt64; var width: Double; var heights: [Float] }
-    struct SavedProp: Codable { var snowman: Bool; var scale: Double; var host: UInt64; var localX: Double; var balls: Bool }
+    struct SavedProp: Codable { var snowman: Bool; var scale: Double; var host: UInt64; var localX: Double; var balls: Bool; var style: SnowmanStyle? = nil }
     struct SavedState: Codable { var time: Date; var piles: [SavedPile]; var props: [SavedProp] }
     var lastSave: CFTimeInterval = CACurrentMediaTime()
     static let stateURL: URL = {
@@ -866,7 +961,7 @@ final class Engine {
         let pr = props.compactMap { m -> SavedProp? in
             if let c = carry, c.prop === m { return nil }
             guard let h = m.host, m.grounded else { return nil }
-            return SavedProp(snowman: m.kind == .snowman, scale: Double(m.scale), host: h, localX: Double(m.localX), balls: m.deco != nil)
+            return SavedProp(snowman: m.kind == .snowman, scale: Double(m.scale), host: h, localX: Double(m.localX), balls: m.deco != nil, style: m.style)
         }
         if let d = try? JSONEncoder().encode(SavedState(time: Date(), piles: ps, props: pr)) {
             try? d.write(to: Engine.stateURL, options: .atomic)
@@ -890,7 +985,7 @@ final class Engine {
         }
         for sp in st.props {
             guard let surf = surfaces[sp.host] else { continue }
-            let m = Prop(kind: sp.snowman ? .snowman : .ball, scale: CGFloat(sp.scale), withBalls: sp.balls)
+            let m = Prop(kind: sp.snowman ? .snowman : .ball, scale: CGFloat(sp.scale), withBalls: sp.balls, style: sp.style)
             m.grounded = true
             addProp(m, on: sp.host, atX: surf.minX + CGFloat(sp.localX), fromY: surf.top)
         }
