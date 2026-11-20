@@ -746,6 +746,21 @@ struct Spill {
     var ttl: CGFloat = .infinity       // finite: a fading poof particle
 }
 
+/// Water drips, splashes, and snapped icicle shards in the front overlay.
+struct WaterDrop {
+    enum Kind { case drop, splash, iceShard }
+    let kind: Kind
+    let layer: CALayer
+    var pos: CGPoint
+    var vx: CGFloat = 0
+    var vy: CGFloat = 0
+    var angle: CGFloat = 0
+    var spin: CGFloat = 0
+    let source: UInt64
+    var ttl: CGFloat = .infinity
+    var maxTtl: CGFloat = 0.3
+}
+
 /// A snowman or a snowball sitting on a surface.
 final class Prop {
     enum Kind { case snowman, ball }
@@ -858,6 +873,7 @@ final class Engine {
     var wins: [Win] = []
     var flakes: [Flake] = []
     var spills: [Spill] = []
+    var waterDrops: [WaterDrop] = []
     var props: [Prop] = []
     var plows: [Plow] = []
     var roll: Roll?
@@ -1049,7 +1065,7 @@ final class Engine {
     func desiredInterval() -> Double? {
         if paused { return nil }
         if mouseIsDown || forceFast { return lowPower ? 1.0 / 30 : 1.0 / 60 }
-        if roll != nil || !plows.isEmpty || !spills.isEmpty || props.contains(where: { !$0.grounded }) { return 1.0 / 30 }
+        if roll != nil || !plows.isEmpty || !spills.isEmpty || !waterDrops.isEmpty || props.contains(where: { !$0.grounded }) { return 1.0 / 30 }
         if Settings.shared.snowOn || !flakes.isEmpty { return lowPower ? 1.0 / 4 : 1.0 / 8 }
         if !props.isEmpty || piles.values.contains(where: { $0.mean > 0.05 }) { return 1.0 / 4 }
         return 1.0
@@ -1160,6 +1176,8 @@ final class Engine {
         for f in flakes { f.layer.removeAllAnimations(); f.layer.removeFromSuperlayer(); flakePool.append(f.layer) }
         for f in spills { f.layer.removeFromSuperlayer(); f.layer.opacity = 1; flakePool.append(f.layer) }
         spills.removeAll()
+        for d in waterDrops { d.layer.removeFromSuperlayer() }
+        waterDrops.removeAll()
         CATransaction.commit()
         flakes.removeAll()
     }
@@ -1359,6 +1377,7 @@ final class Engine {
         }
         updateFlakes(dt: dt, now: now)
         updateSpills(dt: dt)
+        updateWaterDrops(dt: dt)
         if tickCount % 10 == 0 { for p in piles.values where p.mean > 0.05 { p.relax() }; pileDirty = true }
         if virtualNow == nil, now - lastSave > 30 { saveState() }
         if tickCount % 120 == 0 {
@@ -1379,9 +1398,10 @@ final class Engine {
     }
 
     func updateWindMonitor() {
-        if let monitor = windMonitor, !Settings.shared.windOn {
+        let need = Settings.shared.windOn || Settings.shared.meltOn
+        if let monitor = windMonitor, !need {
             NSEvent.removeMonitor(monitor); windMonitor = nil; windPoint = nil
-        } else if Settings.shared.windOn, windMonitor == nil {
+        } else if need, windMonitor == nil {
             windMonitor = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in
                 self?.mouseWind(at: NSEvent.mouseLocation)
             }
@@ -1389,15 +1409,22 @@ final class Engine {
     }
 
     func mouseWind(at p: CGPoint) {
-        guard Settings.shared.windOn, !paused else { return }
+        let windOn = Settings.shared.windOn, meltOn = Settings.shared.meltOn
+        guard (windOn || meltOn), !paused else { return }
+        let hasIcicles = meltOn && piles.values.contains { $0.icicles.contains { $0.length >= 2 * S } }
+        if !windOn && !hasIcicles { windPoint = nil; return }
         let now = clock(), previous = windPoint, elapsed = now - windTime
         windPoint = p; windTime = now
         guard let q = previous, elapsed > 0, elapsed < 0.2,
-              !(mouseIsDown && (roll != nil || carry != nil || drag != nil)),
-              !gustPending, now - lastGust >= 1.0 / 15 else { return }
+              !(mouseIsDown && (roll != nil || carry != nil || drag != nil)) else { return }
         let velocity = CGPoint(x: (p.x - q.x) / CGFloat(elapsed), y: (p.y - q.y) / CGFloat(elapsed))
+        let speed = hypot(velocity.x, velocity.y)
+        if hasIcicles, speed > 350 {
+            swipeIcicles(from: q, to: p, velocity: velocity)
+        }
+        guard windOn, !gustPending, now - lastGust >= 1.0 / 15 else { return }
         let strength: CGFloat = [0.7, 1, 1.4][Settings.shared.windStrength]
-        guard hypot(velocity.x, velocity.y) > 1200 / strength else { return }
+        guard speed > 1200 / strength else { return }
         gustPending = true
         // Keep the event handler constant-time; at most one bounded gust can be queued.
         DispatchQueue.main.async { [weak self] in
@@ -1522,6 +1549,8 @@ final class Engine {
     func meltStep(seconds: CFTimeInterval) {
         guard Settings.shared.meltOn, !paused, seconds > 0 else { return }
         let amount = [CGFloat(0.4), 1.2, 3.0][Settings.shared.meltSpeed] * S * CGFloat(seconds) / 60
+        let dripChance = min(0.35, CGFloat(seconds) * 0.015 * [CGFloat(0.6), 1.0, 1.8][Settings.shared.meltSpeed])
+        var dripTips: [(pos: CGPoint, source: UInt64)] = []
         for (key, pile) in piles where Date().timeIntervalSince(pile.created) >= 180 {
             guard pile.heights.contains(where: { $0 > 0 }) || pile.icicles.contains(where: { $0.length > 0 }) else { continue }
             let before = pile.heights
@@ -1534,14 +1563,33 @@ final class Engine {
                 let site = pile.icicles[i], bin = min(before.count - 1, pile.index(site.x))
                 guard bin >= 0 else { continue }
                 let old = site.length
+                var activeMelt = false
                 if empty {
                     pile.icicles[i].length = max(0, old - amount * 2)
+                    activeMelt = old > 0
                 } else if before[bin] > 0, isVisible(key, surf.minX + site.x) {
                     let growth = (before[bin] - pile.heights[bin]) * site.cap / (4 * S)
                     pile.icicles[i].length = min(site.cap, old + growth)
+                    activeMelt = true
                 }
                 if old != pile.icicles[i].length { pile.icicleDirty = true }
+                let length = pile.icicles[i].length
+                if activeMelt, length >= 5 * S, site.x < surf.width - 12 * S,
+                   isVisible(key, surf.minX + site.x), dripTips.count < 8,
+                   CGFloat.random(in: 0..<1) < dripChance {
+                    let half = min(2.2 * S, length * 0.18) * site.girth
+                    let tip = CGPoint(x: surf.minX + site.x + half * site.lean, y: surf.top - length)
+                    if !wins.contains(where: { $0.z < surf.z && $0.frame.contains(tip) }) {
+                        dripTips.append((pos: tip, source: key))
+                    }
+                }
             }
+        }
+        if !dripTips.isEmpty, !overlays.isEmpty {
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            for tip in dripTips { spawnWaterDrop(at: tip.pos, source: tip.source) }
+            CATransaction.commit()
+            updateRate()
         }
     }
 
@@ -1560,6 +1608,95 @@ final class Engine {
             path.closeSubpath()
         }
         return path
+    }
+
+    func icicleHit(at p: CGPoint, pad: CGFloat = 4 * S) -> (key: UInt64, index: Int)? {
+        guard Settings.shared.meltOn, !paused else { return nil }
+        for surf in surfaces.values.filter({ $0.z >= 0 }).sorted(by: { $0.z < $1.z }) {
+            guard let pile = piles[surf.key], !pile.icicles.isEmpty else { continue }
+            guard p.x >= surf.minX - pad, p.x <= surf.maxX + pad,
+                  p.y >= surf.top - 32 * S - pad, p.y <= surf.top + min(pad, 2.5 * S) else { continue }
+            guard !wins.contains(where: { $0.z < surf.z && $0.frame.contains(p) }) else { continue }
+            var best: (index: Int, dist: CGFloat)?
+            for i in pile.icicles.indices {
+                let site = pile.icicles[i]
+                guard site.length >= 2 * S, site.x < surf.width - 12 * S else { continue }
+                let gx = surf.minX + site.x
+                guard isVisible(surf.key, gx) else { continue }
+                let half = min(2.2 * S, site.length * 0.18) * site.girth
+                let tipX = gx + half * site.lean
+                let minX = min(gx - half, tipX) - pad
+                let maxX = max(gx + half, tipX) + pad
+                let minY = surf.top - site.length - pad
+                let maxY = surf.top + min(pad, 2.5 * S)
+                guard p.x >= minX, p.x <= maxX, p.y >= minY, p.y <= maxY else { continue }
+                let dist = hypot(p.x - (gx + tipX) * 0.5, p.y - (surf.top - site.length * 0.5))
+                if best == nil || dist < best!.dist { best = (i, dist) }
+            }
+            if let best { return (surf.key, best.index) }
+        }
+        return nil
+    }
+
+    func snapIcicle(on key: UInt64, index: Int, vx: CGFloat = 0, vy: CGFloat = 0) {
+        guard let surf = surfaces[key], let pile = piles[key], pile.icicles.indices.contains(index) else { return }
+        let site = pile.icicles[index]
+        guard site.length >= 2 * S else { return }
+        let length = site.length
+        pile.icicles[index].length = 0
+        pile.icicleDirty = true; pileDirty = true
+        lastPileDraw = -.infinity
+        guard !overlays.isEmpty else { return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        spawnIceShard(on: surf, site: site, length: length, vx: vx, vy: vy)
+        let breakPt = CGPoint(x: surf.minX + site.x, y: surf.top - min(2 * S, length * 0.15))
+        spawnWaterSplash(at: breakPt, count: Int.random(in: 2...3), icy: true, source: key, baseVx: vx * 0.35)
+        CATransaction.commit()
+        updateRate()
+    }
+
+    private func segmentIntersectsRect(_ a: CGPoint, _ b: CGPoint, _ r: CGRect) -> CGPoint? {
+        let dx = b.x - a.x, dy = b.y - a.y
+        var t0: CGFloat = 0, t1: CGFloat = 1
+        for (p, q) in [(-dx, a.x - r.minX), (dx, r.maxX - a.x), (-dy, a.y - r.minY), (dy, r.maxY - a.y)] {
+            if abs(p) < 1e-6 {
+                if q < 0 { return nil }
+            } else {
+                let ratio = q / p
+                if p < 0 { t0 = max(t0, ratio) } else { t1 = min(t1, ratio) }
+                if t0 > t1 { return nil }
+            }
+        }
+        let t = (t0 + t1) * 0.5
+        return CGPoint(x: a.x + dx * t, y: a.y + dy * t)
+    }
+
+    func swipeIcicles(from q: CGPoint, to p: CGPoint, velocity: CGPoint) {
+        guard Settings.shared.meltOn, !paused, !overlays.isEmpty else { return }
+        let pad = 4 * S
+        let segMinX = min(q.x, p.x) - pad, segMaxX = max(q.x, p.x) + pad
+        let segMinY = min(q.y, p.y) - pad, segMaxY = max(q.y, p.y) + pad
+        let vx = max(-420 * S, min(420 * S, velocity.x * 0.28))
+        let vy = max(-100 * S, min(140 * S, velocity.y * 0.1 + 30 * S))
+        for (key, surf) in surfaces where surf.z >= 0 {
+            guard segMaxX >= surf.minX, segMinX <= surf.maxX,
+                  segMaxY >= surf.top - 32 * S, segMinY <= surf.top + 2.5 * S else { continue }
+            guard let pile = piles[key], !pile.icicles.isEmpty else { continue }
+            for i in pile.icicles.indices {
+                let site = pile.icicles[i]
+                guard site.length >= 2 * S, site.x < surf.width - 12 * S else { continue }
+                let gx = surf.minX + site.x
+                guard isVisible(key, gx) else { continue }
+                let half = min(2.2 * S, site.length * 0.18) * site.girth
+                let tipX = gx + half * site.lean
+                let rect = CGRect(x: min(gx - half, tipX) - pad, y: surf.top - site.length - pad,
+                                  width: abs(half * site.lean) + 2 * half + 2 * pad,
+                                  height: site.length + pad + min(pad, 2.5 * S))
+                guard let hit = segmentIntersectsRect(q, p, rect) else { continue }
+                guard !wins.contains(where: { $0.z < surf.z && $0.frame.contains(hit) }) else { continue }
+                snapIcicle(on: key, index: i, vx: vx, vy: vy)
+            }
+        }
     }
 
     // MARK: flakes
@@ -1769,6 +1906,132 @@ final class Engine {
             }
         }
         spills = kept
+    }
+
+    func spawnWaterDrop(at pos: CGPoint, source: UInt64) {
+        guard waterDrops.count < 140, !overlays.isEmpty else { return }
+        let r = CGFloat.random(in: 1.35...1.85) * S
+        let h = r * 2.7
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: r, y: h))
+        path.addQuadCurve(to: CGPoint(x: 2 * r, y: r), control: CGPoint(x: 1.95 * r, y: h * 0.52))
+        path.addQuadCurve(to: CGPoint(x: r, y: 0), control: CGPoint(x: 2 * r, y: 0))
+        path.addQuadCurve(to: CGPoint(x: 0, y: r), control: CGPoint(x: 0, y: 0))
+        path.addQuadCurve(to: CGPoint(x: r, y: h), control: CGPoint(x: 0.05 * r, y: h * 0.52))
+        path.closeSubpath()
+        let layer = CAShapeLayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 2 * r, height: h)
+        layer.path = path
+        layer.fillColor = CGColor(srgbRed: 150 / 255, green: 215 / 255, blue: 1, alpha: 0.85)
+        layer.strokeColor = CGColor(srgbRed: 215 / 255, green: 240 / 255, blue: 1, alpha: 0.7)
+        layer.lineWidth = 0.4
+        layer.contentsScale = 2
+        let o = overlays[overlayIndex(for: pos)]
+        layer.position = o.local(pos)
+        o.actors.addSublayer(layer)
+        waterDrops.append(WaterDrop(kind: .drop, layer: layer, pos: pos,
+                                    vx: .random(in: -4...4) * S, vy: -10 * S, source: source))
+    }
+
+    func spawnIceShard(on surf: Surface, site: Icicle, length: CGFloat, vx: CGFloat = 0, vy: CGFloat = 0) {
+        guard waterDrops.count < 140, !overlays.isEmpty else { return }
+        let half = min(2.2 * S, length * 0.18) * site.girth
+        let pad = abs(half * site.lean) + 1
+        let cx = half + pad
+        let path = CGMutablePath()
+        let tip = CGPoint(x: cx + half * site.lean, y: 0)
+        path.move(to: CGPoint(x: cx - half, y: length))
+        path.addQuadCurve(to: tip, control: CGPoint(x: tip.x - half * 0.4, y: length * 0.35))
+        path.addQuadCurve(to: CGPoint(x: cx + half, y: length),
+                          control: CGPoint(x: tip.x + half * 0.5, y: length * 0.45))
+        path.closeSubpath()
+        let layer = CAShapeLayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: cx * 2, height: length)
+        layer.path = path
+        layer.fillColor = NSColor(calibratedRed: 230 / 255, green: 244 / 255, blue: 1, alpha: 0.88).cgColor
+        layer.strokeColor = NSColor(calibratedRed: 191 / 255, green: 227 / 255, blue: 1, alpha: 0.92).cgColor
+        layer.lineWidth = 0.5
+        layer.contentsScale = 2
+        let pos = CGPoint(x: surf.minX + site.x + half * site.lean * 0.5, y: surf.top - length * 0.5)
+        let o = overlays[overlayIndex(for: pos)]
+        layer.position = o.local(pos)
+        o.actors.addSublayer(layer)
+        let dir: CGFloat = vx != 0 ? (vx > 0 ? -1 : 1) : (Bool.random() ? 1 : -1)
+        let spin = dir * CGFloat.random(in: 5...11)
+        waterDrops.append(WaterDrop(kind: .iceShard, layer: layer, pos: pos, vx: vx, vy: vy,
+                                    spin: spin, source: surf.key))
+    }
+
+    func spawnWaterSplash(at pos: CGPoint, count: Int, icy: Bool, source: UInt64, baseVx: CGFloat = 0) {
+        guard !overlays.isEmpty else { return }
+        for _ in 0..<count {
+            guard waterDrops.count < 140 else { break }
+            let layer = CALayer()
+            let r = (icy ? CGFloat.random(in: 0.85...1.6) : CGFloat.random(in: 0.75...1.3)) * S
+            layer.bounds = CGRect(x: 0, y: 0, width: 2 * r, height: 2 * r)
+            layer.cornerRadius = r
+            if icy {
+                layer.backgroundColor = CGColor(srgbRed: 235 / 255, green: 247 / 255, blue: 1, alpha: 0.96)
+                layer.borderColor = CGColor(srgbRed: 175 / 255, green: 225 / 255, blue: 1, alpha: 0.85)
+                layer.borderWidth = 0.4
+            } else {
+                layer.backgroundColor = CGColor(srgbRed: 170 / 255, green: 225 / 255, blue: 1, alpha: 0.92)
+            }
+            let o = overlays[overlayIndex(for: pos)]
+            layer.position = o.local(pos)
+            o.actors.addSublayer(layer)
+            let ttl = CGFloat.random(in: 0.22...0.38)
+            let vx = baseVx + (icy ? CGFloat.random(in: -135...135) : CGFloat.random(in: -75...75)) * S
+            let vy = (icy ? CGFloat.random(in: 65...175) : CGFloat.random(in: 55...135)) * S
+            waterDrops.append(WaterDrop(kind: .splash, layer: layer, pos: pos, vx: vx, vy: vy,
+                                        source: source, ttl: ttl, maxTtl: ttl))
+        }
+    }
+
+    func updateWaterDrops(dt: CGFloat) {
+        guard !waterDrops.isEmpty else { return }
+        let bottom = (overlays.map { $0.frame.minY }.min() ?? 0) - 20 * S
+        var kept: [WaterDrop] = []
+        var pendingSplashes: [(pos: CGPoint, count: Int, icy: Bool, source: UInt64, baseVx: CGFloat)] = []
+        for var d in waterDrops {
+            let oldY = d.pos.y
+            let g: CGFloat = d.kind == .iceShard ? 1100 * S : (d.kind == .drop ? 900 * S : 780 * S)
+            d.vy -= g * dt
+            d.pos.y += d.vy * dt
+            d.pos.x += d.vx * dt
+            if d.kind == .iceShard {
+                d.angle += d.spin * dt
+                d.layer.setAffineTransform(CGAffineTransform(rotationAngle: d.angle))
+            }
+            var landed = false
+            if d.kind != .splash, d.pos.y < oldY,
+               let s = landingSurface(at: d.pos.x, below: oldY, above: d.pos.y, excluding: d.source) {
+                landed = true
+                let hitPos = CGPoint(x: d.pos.x, y: s.top + 1 * S)
+                if d.kind == .drop {
+                    pendingSplashes.append((pos: hitPos, count: Int.random(in: 3...4), icy: false, source: s.key, baseVx: d.vx * 0.2))
+                } else {
+                    pendingSplashes.append((pos: hitPos, count: Int.random(in: 4...6), icy: true, source: s.key, baseVx: d.vx * 0.25))
+                }
+            }
+            if d.kind == .splash {
+                d.ttl -= dt
+                d.vx *= 1 - min(1, 2.5 * dt)
+                d.layer.opacity = Float(max(0, min(1, d.ttl / max(0.01, d.maxTtl))))
+            }
+            if landed || d.pos.y < bottom || (d.kind == .splash && d.ttl <= 0) {
+                d.layer.removeFromSuperlayer()
+            } else {
+                let o = overlays[overlayIndex(for: d.pos)]
+                if d.layer.superlayer !== o.actors { o.actors.addSublayer(d.layer) }
+                d.layer.position = o.local(d.pos)
+                kept.append(d)
+            }
+        }
+        waterDrops = kept
+        for sp in pendingSplashes {
+            spawnWaterSplash(at: sp.pos, count: sp.count, icy: sp.icy, source: sp.source, baseVx: sp.baseVx)
+        }
     }
 
     // MARK: piles
@@ -2331,6 +2594,7 @@ final class Engine {
     var downTime: CFTimeInterval = 0
     var downWin: Win?
     weak var downSnowman: Prop?
+    var downIcicle: (key: UInt64, index: Int)?
 
     func topWindow(at p: CGPoint, in list: [Win]) -> Win? { list.first { $0.frame.contains(p) }.flatMap { $0.surface ? $0 : nil } }
 
@@ -2344,6 +2608,7 @@ final class Engine {
     func mouseDown(at p: CGPoint) {
         carryCancel(); carry = nil
         downSnowman = nil
+        downIcicle = nil
         mouseIsDown = true
         refreshGeometry()
         if expose { downPoint = nil; downWin = nil; drag = nil; rollCancel(); return }   // Mission Control clicks
@@ -2363,6 +2628,9 @@ final class Engine {
         } else if let m = prop(at: p), m.kind == .snowman {
             rollCancel()
             downSnowman = m
+        } else if Settings.shared.meltOn, let ic = icicleHit(at: p, pad: 4 * S) {
+            rollCancel()
+            downIcicle = ic
         } else { rollBegin(at: p) }
         CATransaction.commit()
         updateRate()
@@ -2453,16 +2721,30 @@ final class Engine {
             let x = surf.minX + min(surf.width, CGFloat(i) * Pile.step)
             samples.append((x: x, y: surf.top + h - t / 2, area: t * Pile.step))
         }
+        var snappedShards: [(site: Icicle, length: CGFloat)] = []
         if pile.icicles.contains(where: { $0.length > 0 }) {        // icicles snap off with it
             let keep = 1 - min(1, f * 1.5)
             for index in pile.icicles.indices {
-                let length = pile.icicles[index].length * keep
+                let oldSite = pile.icicles[index]
+                let length = oldSite.length * keep
                 pile.icicles[index].length = length < 1 ? 0 : length
+                if oldSite.length >= 2 * S, pile.icicles[index].length == 0,
+                   oldSite.x < surf.width - 12 * S, isVisible(key, surf.minX + oldSite.x) {
+                    snappedShards.append((site: oldSite, length: oldSite.length))
+                }
             }
             pile.icicleDirty = true
         }
         pile.dirty = true; pileDirty = true
         CATransaction.begin(); CATransaction.setDisableActions(true)
+        if !snappedShards.isEmpty {
+            let picks = snappedShards.count > 6 ? Array(snappedShards.shuffled().prefix(6)) : snappedShards
+            for item in picks {
+                let vx = max(-420 * S, min(420 * S, fling.x * .random(in: 0.18...0.45))) + .random(in: -30...30) * S
+                let vy = max(-180 * S, min(260 * S, fling.y * .random(in: 0.15...0.35))) + .random(in: -20...60) * S
+                spawnIceShard(on: surf, site: item.site, length: item.length, vx: vx, vy: vy)
+            }
+        }
         if !samples.isEmpty {
             spillSnow(samples, from: surf, toss: fling)
             // fine powder: a short-lived puff over the snow line
@@ -2496,7 +2778,7 @@ final class Engine {
 
     func mouseUp(at p: CGPoint) {
         mouseIsDown = false
-        defer { downSnowman = nil; updateRate() }
+        defer { downSnowman = nil; downIcicle = nil; updateRate() }
         let draggedWindow = drag?.confirmed == true
         if draggedWindow {
             carryCancel()
@@ -2534,6 +2816,11 @@ final class Engine {
             m.remove()
             snowPuff(for: m, baseY: m.pos.y, source: m.host ?? 0)
             saveState()
+            return
+        }
+        if let ic = downIcicle {
+            guard !draggedWindow else { return }
+            snapIcicle(on: ic.key, index: ic.index)
             return
         }
         if let m = prop(at: p) {

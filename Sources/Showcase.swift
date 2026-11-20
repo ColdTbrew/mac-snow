@@ -207,11 +207,46 @@ enum Showcase {
             engine.piles[2]?.fill()
             engine.piles[2]?.created = .distantPast
             let before = engine.piles[2]?.mean ?? 0
-            step(30, record: true) { _ in engine.meltStep(seconds: 20) }
+            var sawDrip = false
+            step(30, record: true) { _ in
+                engine.meltStep(seconds: 20)
+                if engine.waterDrops.contains(where: { $0.kind == .drop }) { sawDrip = true }
+            }
+            precondition(sawDrip, "melting should produce dripping water drops")
             still("still-9-icicles")
             still("icicles-zoom", scale: 3, crop: CGRect(x: surf.minX + 10, y: surf.top - 30, width: 380, height: 70))
             let ic = engine.piles[2]?.icicles.map(\.length).filter { $0 > 0 } ?? []
             print("melt mean \(before) -> \(engine.piles[2]?.mean ?? 0), icicles n=\(ic.count) max=\(ic.max() ?? 0)")
+            if let pile = engine.piles[2] {
+                let targets = pile.icicles.indices.filter {
+                    pile.icicles[$0].length >= 4 * S &&
+                    pile.icicles[$0].x < surf.width - 12 * S &&
+                    engine.isVisible(surf.key, surf.minX + pile.icicles[$0].x)
+                }
+                precondition(targets.count >= 2, "expected at least 2 visible icicles to test click and swipe")
+                // Clicking an icicle snaps it and spawns an .iceShard without spawning a snowman.
+                let idx1 = targets[0], site1 = pile.icicles[idx1]
+                let half1 = min(2.2 * S, site1.length * 0.18) * site1.girth
+                let clickPt = CGPoint(x: surf.minX + site1.x + half1 * site1.lean * 0.5, y: surf.top - site1.length * 0.5)
+                let shardsBeforeClick = engine.waterDrops.filter { $0.kind == .iceShard }.count
+                let propsBeforeClick = engine.props.count
+                engine.mouseDown(at: clickPt)
+                engine.mouseUp(at: clickPt)
+                precondition(pile.icicles[idx1].length == 0, "clicking an icicle should snap it (length == 0)")
+                precondition(engine.waterDrops.filter { $0.kind == .iceShard }.count == shardsBeforeClick + 1, "clicking an icicle should spawn an .iceShard")
+                precondition(engine.props.count == propsBeforeClick, "clicking an icicle should not spawn a snowman")
+                // Swiping quickly across a visible icicle snaps it.
+                let idx2 = targets[1], site2 = pile.icicles[idx2]
+                let gx2 = surf.minX + site2.x, y2 = surf.top - site2.length * 0.5
+                let shardsBeforeSwipe = engine.waterDrops.filter { $0.kind == .iceShard }.count
+                engine.mouseWind(at: CGPoint(x: gx2 - 25 * S, y: y2))
+                step(1)
+                engine.mouseWind(at: CGPoint(x: gx2 + 25 * S, y: y2))
+                precondition(pile.icicles[idx2].length == 0, "swiping across an icicle should snap it (length == 0)")
+                precondition(engine.waterDrops.filter { $0.kind == .iceShard }.count >= shardsBeforeSwipe + 1, "swiping an icicle should spawn an .iceShard")
+                step(15, record: true)
+                print("icicle interact: click snapped idx=\(idx1), swipe snapped idx=\(idx2), waterDrops=\(engine.waterDrops.count)")
+            }
         }
         // 12) grab Music by its title bar and shake it: the snow and its snowman fly off.
         let mi = fake.index(2)
