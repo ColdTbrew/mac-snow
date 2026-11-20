@@ -214,8 +214,10 @@ enum DockGeometry {
         guard !(dock?.bool(forKey: "autohide") ?? false),
               (dock?.string(forKey: "orientation") ?? "bottom") == "bottom" else { return nil }
         if let ax = axFrame {
-            guard f.contains(CGPoint(x: ax.midX, y: ax.midY)) else { return nil }
-            return (ax.minX, ax.maxX, ax.maxY - topInset)
+            let sideInset = max(18, min(28, ax.height * 0.28))
+            guard f.contains(CGPoint(x: ax.midX, y: ax.midY)),
+                  ax.width > sideInset * 2 + 40 else { return nil }
+            return (ax.minX + sideInset, ax.maxX - sideInset, ax.maxY - topInset)
         }
         guard v.minY - f.minY > 20 else { return nil }          // hidden or on the side
         let ts = CGFloat(dock?.double(forKey: "tilesize") ?? 0)
@@ -238,10 +240,11 @@ enum DockGeometry {
         let showRecents = dock?.object(forKey: "show-recents") as? Bool ?? true
         let icons = 1 + apps.count + extra.count + others + 1 + (showRecents ? 3 : 0)
         let seps = 1 + (showRecents ? 1 : 0)
-        // each icon slot is a bit wider than tilesize (calibrated on one Mac against the AX frame:
-        // 32 icons, tile 64 -> 2290 pt)
-        var width = CGFloat(icons) * tile * 1.1 + CGFloat(seps) * tile * 0.3 + tile * 0.35
-        width = min(width, f.width - 8)
+        // Each icon slot is slightly wider than tilesize; inset both ends so fallback snow
+        // stays strictly narrower than the Dock's rounded pill even without AX permission.
+        var width = CGFloat(icons) * tile * 1.03 + CGFloat(seps) * tile * 0.28 + tile * 0.15
+        let sideInset = max(18, tile * 0.38)
+        width = max(60, min(width, f.width - 8) - sideInset * 2)
         return (f.midX - width / 2, f.midX + width / 2, v.minY)     // AX: list maxY - topInset == visibleFrame.minY
     }
 }
@@ -1768,23 +1771,24 @@ final class Engine {
     // MARK: piles
 
     static let windowCorner: CGFloat = 12
-    static let dockCorner: CGFloat = 16
 
     /// Snow on one surface as a closed path (global coords): tapers to nothing over the last
-    /// stretch and wraps over the rounded corner.
+    /// stretch and wraps over the rounded corner (on the Dock it tapers flat along the top).
     func pilePath(_ surf: Surface, _ pile: Pile) -> CGPath? {
         let width = surf.width
         guard width > 30 else { return nil }
-        let R = surf.z < 0 ? Engine.dockCorner : Engine.windowCorner
-        let T = max(R + 4, 16 * S)                    // taper length
-        func drop(_ d: CGFloat) -> CGFloat { d >= R ? 0 : R - (R * R - (R - d) * (R - d)).squareRoot() }
+        let isDock = surf.z < 0
+        let R: CGFloat = isDock ? 0 : Engine.windowCorner
+        let T = isDock ? max(14, 16 * S) : max(R + 4, 16 * S)   // taper length
+        func drop(_ d: CGFloat) -> CGFloat { R <= 0 || d >= R ? 0 : R - (R * R - (R - d) * (R - d)).squareRoot() }
         func smooth(_ t: CGFloat) -> CGFloat { let u = max(0, min(1, t)); return u * u * (3 - 2 * u) }
         var tops: [CGPoint] = [], bots: [CGPoint] = []
         var x: CGFloat = 0
         while true {
             let cx = min(x, width)
             let d = min(cx, width - cx)
-            let h = pile.height(at: cx) * smooth(d / T) * (0.35 + 0.65 * smooth(d / (R * 0.8)))
+            let taper = smooth(d / T) * (isDock ? 1 : 0.35 + 0.65 * smooth(d / (R * 0.8)))
+            let h = pile.height(at: cx) * taper
             let base = surf.top - drop(d)
             tops.append(CGPoint(x: surf.minX + cx, y: base + h))
             bots.append(CGPoint(x: surf.minX + cx, y: base - min(1.5, h)))

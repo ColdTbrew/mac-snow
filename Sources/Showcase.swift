@@ -46,7 +46,10 @@ enum Showcase {
         let ov = Overlay(virtualFrame: CGRect(origin: .zero, size: size))
         engine.overlays = [ov]
         engine.windowSource = fake
-        engine.dockSource = { _ in (dockRect.minX + 10, dockRect.maxX - 10, dockRect.maxY) }
+        engine.dockSource = { _ in
+            let inset = max(18, min(28, dockRect.height * 0.28))
+            return (dockRect.minX + inset, dockRect.maxX - inset, dockRect.maxY)
+        }
         engine.lowPower = false
         engine.forceFast = true            // re-read (fake) window geometry every step
         var t: CFTimeInterval = 0
@@ -88,6 +91,16 @@ enum Showcase {
         still("still-1-snow")
         still("pile-end-zoom", scale: 3, crop: CGRect(x: 80, y: 610, width: 260, height: 80))
         still("pile-occlusion-zoom", scale: 3, crop: CGRect(x: 600, y: 610, width: 200, height: 120))
+        if let dock = engine.surfaces[Engine.dockKey(0)], let pile = engine.piles[dock.key],
+           let gp = engine.pilePath(dock, pile) {
+            let box = gp.boundingBoxOfPath
+            precondition(dock.minX >= dockRect.minX + 18 && dock.maxX <= dockRect.maxX - 18)
+            precondition(box.minX >= dock.minX - 0.5 && box.maxX <= dock.maxX + 0.5 && box.minY >= dock.top - 2.0)
+        }
+        if let win = engine.surfaces[1], let pile = engine.piles[1],
+           let gp = engine.pilePath(win, pile) {
+            precondition(gp.boundingBoxOfPath.minY < win.top - 6)
+        }
         // 3) roll a snowball along Finder's snow, release -> snowman
         engine.demoBoost = 1
         let finder = fake.list[fake.index(1)].frame
