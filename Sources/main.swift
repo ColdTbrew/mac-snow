@@ -1,5 +1,6 @@
 // MacSnow — menu bar snow that lands and piles up on window tops and the Dock.
 import AppKit
+import SwiftUI
 import QuartzCore
 import ApplicationServices
 import IOKit.ps
@@ -1271,6 +1272,7 @@ final class Engine {
     var timer: Timer?
     var interval: Double = 0
     var paused = false
+    var onStateChange: (() -> Void)?
     var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
     var onAC = true
     var powerSource: CFRunLoopSource?
@@ -1635,6 +1637,7 @@ final class Engine {
         refreshGeometry()
         CATransaction.commit()
         updateRate()
+        onStateChange?()
     }
 
     func clearSnow() { piles.removeAll(); dropAllFlakes(); pileDirty = true; geometryChanged = true; removeAllProps() }
@@ -3971,11 +3974,16 @@ final class Updater {
 
 // MARK: - App / menu bar
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     let engine = Engine()
     var item: NSStatusItem!
-    let menu = NSMenu()
+    var panel: FloatingMenuPanel!
+    var hostingController: NSHostingController<MenuPopoverView>!
+    var menuModel: MenuModel!
     var updater: Updater?
+    var popoverMonitor: Any?
+    var refreshTimer: Timer?
+    var openGeneration = 0
 
     var termSource: DispatchSourceSignal?
     func applicationWillTerminate(_ n: Notification) { engine.saveState() }
@@ -3987,14 +3995,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         termSource?.setEventHandler { [weak self] in self?.engine.saveState(); exit(0) }
         termSource?.resume()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        updateStatusIcon()
         if let b = item.button {
-            if let img = NSImage(systemSymbolName: "snowflake", accessibilityDescription: "MacSnow") {
-                img.isTemplate = true; b.image = img
-            } else { b.title = "❄" }
+            b.target = self
+            b.action = #selector(togglePopover(_:))
         }
-        menu.delegate = self
-        item.menu = menu
         updater = Updater()
+        menuModel = MenuModel(
+            engine: engine,
+            updater: updater,
+            actions: MenuModel.Actions(
+                requestDockAccess: { [weak self] in self?.requestDockAccess() },
+                toggleLogin: { [weak self] in self?.toggleLogin() },
+                checkForUpdates: { [weak self] in self?.checkForUpdates() },
+                closePopover: { [weak self] in self?.closePopover() },
+                updateStatusIcon: { [weak self] in self?.updateStatusIcon() },
+                quit: { [weak self] in self?.quit() }
+            )
+        )
+        hostingController = NSHostingController(rootView: MenuPopoverView(model: menuModel))
+
+        panel = FloatingMenuPanel(
+            contentRect: NSRect(x: 0, y: 0, width: MenuPopoverView.contentWidth + MenuPopoverView.outerPadding * 2, height: 500),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .transient, .fullScreenAuxiliary, .ignoresCycle]
+        panel.isReleasedWhenClosed = false
+        panel.isMovable = false
+        panel.contentViewController = hostingController
+        panel.onEscape = { [weak self] in self?.closePopover() }
+
+        engine.onStateChange = { [weak self] in
+            self?.updateStatusIcon()
+            self?.menuModel?.refresh()
+        }
         engine.start()
         askDockAccessOncePerBuild()
         if ProcessInfo.processInfo.arguments.contains("--demo") {
@@ -4003,75 +4043,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        let s = Settings.shared
-        menu.removeAllItems()
-        func add(_ title: String, _ sel: Selector, on: Bool? = nil, key: String = "", enabled: Bool = true) {
-            let i = NSMenuItem(title: title, action: enabled ? sel : nil, keyEquivalent: key)
-            i.target = enabled ? self : nil
-            if let on { i.state = on ? .on : .off }
-            menu.addItem(i)
+    func updateStatusIcon() {
+        guard let b = item?.button else { return }
+        let campfire = Settings.shared.campfireOn
+        let sym = campfire ? "flame.fill" : "snowflake"
+        if let img = NSImage(systemSymbolName: sym, accessibilityDescription: "MacSnow") {
+            img.isTemplate = true
+            b.image = img
+        } else {
+            b.title = campfire ? "🔥" : "❄"
         }
-        add("눈 내리기 (Snow)", #selector(toggleSnow), on: s.snowOn)
-        let sub = NSMenu()
-        for it in Intensity.allCases {
-            let i = NSMenuItem(title: it.title, action: #selector(setIntensity(_:)), keyEquivalent: "")
-            i.target = self; i.tag = it.rawValue; i.state = it == s.intensity ? .on : .off
-            sub.addItem(i)
-        }
-        let parent = NSMenuItem(title: "세기 (Intensity)", action: nil, keyEquivalent: "")
-        parent.submenu = sub
-        menu.addItem(parent)
-        func choices(_ title: String, _ titles: [String], _ selected: Int, _ action: Selector) {
-            let submenu = NSMenu()
-            for (tag, title) in titles.enumerated() {
-                let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
-                i.target = self; i.tag = tag; i.state = tag == selected ? .on : .off
-                submenu.addItem(i)
-            }
-            let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            i.submenu = submenu; menu.addItem(i)
-        }
-        add("마우스 바람 (Mouse wind)", #selector(toggleWind), on: s.windOn)
-        choices("바람 세기 (Wind strength)", ["약하게 (Gentle)", "보통 (Normal)", "세게 (Strong)"], s.windStrength, #selector(setWindStrength(_:)))
-        add("창 흔들어 눈 털기 (Shake off snow)", #selector(toggleShake), on: s.shakeOn)
-        choices("눈 털기 강도 (Shake strength)", ShakeStrength.allCases.map { $0.title }, s.shakeStrength.rawValue, #selector(setShakeStrength(_:)))
-        add("녹기·고드름 (Melting & icicles)", #selector(toggleMelt), on: s.meltOn)
-        choices("녹는 속도 (Melt speed)", ["느리게 (Slow)", "보통 (Normal)", "빠르게 (Fast)"], s.meltSpeed, #selector(setMeltSpeed(_:)))
-        add("모닥불 모드 (Campfire mode)", #selector(toggleCampfire), on: s.campfireOn)
-        choices("배터리 절약 (Battery saving)", BatteryMode.allCases.map { $0.title }, s.batteryMode.rawValue, #selector(setBatteryMode(_:)))
-        add("로그인 시 자동 실행 (Launch at login)", #selector(toggleLogin), on: SMAppService.mainApp.status == .enabled)
-        add("눈사람 (Snowmen) — 제목줄 클릭 / 눈 굴리기", #selector(toggleSnowmen), on: s.snowmenOn)
-        add("제설차 자동 (Auto plow)", #selector(toggleAutoPlow), on: s.autoPlow)
-        add("눈송이 창 위로 (Flakes over windows)", #selector(toggleFlakesOnTop), on: s.flakesOnTop)
-        add("전체화면에서 숨기기 (Hide in full screen)", #selector(toggleHideInFullscreen), on: s.hideInFullscreen)
-        if !AXIsProcessTrusted() {
-            add("Dock 크기 정확히 맞추기 (손쉬운 사용 권한)", #selector(requestDockAccess))
-        }
-        menu.addItem(.separator())
-        add("지금 Dock 제설 (Plow the Dock now)", #selector(plowNow))
-        add("앞 창에 눈사람 놓기 (Debug)", #selector(debugSpawn))
-        add("눈 치우기 (Clear snow)", #selector(clearSnow))
-        menu.addItem(.separator())
-        add("업데이트 확인… (Check for Updates…)", #selector(checkForUpdates), enabled: updater?.canCheckForUpdates ?? false)
-        add("자동 업데이트 확인 (Check for updates automatically)", #selector(toggleAutoUpdates), on: updater?.automaticallyChecksForUpdates ?? false, enabled: updater?.isConfigured ?? false)
-        menu.addItem(.separator())
-        add("종료 (Quit)", #selector(quit), key: "q")
     }
 
-    @objc func toggleWind() { Settings.shared.windOn.toggle(); engine.updateMouseMoveMonitor() }
-    @objc func setWindStrength(_ i: NSMenuItem) { Settings.shared.windStrength = i.tag }
-    @objc func toggleShake() { Settings.shared.shakeOn.toggle() }
-    @objc func setShakeStrength(_ i: NSMenuItem) { Settings.shared.shakeStrength = ShakeStrength(rawValue: i.tag) ?? .normal }
-    @objc func toggleMelt() { Settings.shared.meltOn.toggle(); engine.applySettings() }
-    @objc func setMeltSpeed(_ i: NSMenuItem) { Settings.shared.meltSpeed = i.tag; engine.lastMelt = engine.clock() }
-    @objc func toggleCampfire() { Settings.shared.campfireOn.toggle(); engine.applySettings() }
-    @objc func setBatteryMode(_ i: NSMenuItem) { Settings.shared.batteryMode = BatteryMode(rawValue: i.tag) ?? .auto; engine.updatePower() }
+    @MainActor @objc func togglePopover(_ sender: Any?) {
+        if panel.isVisible {
+            closePopover()
+            return
+        }
+        guard let b = item.button else { return }
+        openGeneration += 1
+        menuModel.refresh()
+        hostingController.view.layoutSubtreeIfNeeded()
+        let pad = MenuPopoverView.outerPadding
+        let width = MenuPopoverView.contentWidth + pad * 2
+        let size = NSSize(width: width, height: ceil(hostingController.view.fittingSize.height))
+        let buttonRect: NSRect = if let btnWin = b.window {
+            btnWin.convertToScreen(b.convert(b.bounds, to: nil))
+        } else {
+            NSRect(origin: NSEvent.mouseLocation, size: .zero)
+        }
+        let screen = NSScreen.screens.first { $0.frame.contains(CGPoint(x: buttonRect.midX, y: buttonRect.midY)) }
+            ?? NSScreen.main ?? NSScreen.screens.first
+        if let screen {
+            let vf = screen.visibleFrame
+            var x = buttonRect.midX - size.width / 2
+            x = max(vf.minX + 8 - pad, min(x, vf.maxX - size.width - 8 + pad))
+            var y = buttonRect.minY - 6 - size.height + pad
+            y = max(vf.minY + 8 - pad, y)
+            panel.setFrame(NSRect(x: round(x), y: round(y), width: size.width, height: size.height), display: true)
+        }
+        panel.alphaValue = 0
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.14
+            panel.animator().alphaValue = 1
+        }
+        popoverMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.closePopover()
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidResignActive),
+                                               name: NSApplication.didResignActiveNotification, object: nil)
+        refreshTimer?.invalidate()
+        let model = menuModel
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            Task { @MainActor in model?.refreshLiveStats() }
+        }
+    }
+
+    @MainActor @objc func appDidResignActive() { closePopover() }
+
+    func closePopover() {
+        if let monitor = popoverMonitor {
+            NSEvent.removeMonitor(monitor)
+            popoverMonitor = nil
+        }
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        guard panel.isVisible else { return }
+        let gen = openGeneration
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.10
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            Task { @MainActor in
+                guard let self, self.openGeneration == gen else { return }
+                self.panel.orderOut(nil)
+            }
+        })
+    }
+
     @objc func toggleLogin() {
         let service = SMAppService.mainApp
         do {
             if service.status == .enabled { try service.unregister() } else { try service.register() }
         } catch {
+            closePopover()
             let alert = NSAlert()
             alert.messageText = "로그인 시 자동 실행 (Launch at login)"
             alert.informativeText = error.localizedDescription
@@ -4079,12 +4137,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
     }
-    @objc func toggleSnow() { Settings.shared.snowOn.toggle(); engine.updateRate() }
-    @objc func toggleSnowmen() { Settings.shared.snowmenOn.toggle(); engine.applySettings() }
-    @objc func toggleAutoPlow() { Settings.shared.autoPlow.toggle() }
-    @objc func toggleFlakesOnTop() { Settings.shared.flakesOnTop.toggle(); engine.applySettings() }
-    @objc func toggleHideInFullscreen() { Settings.shared.hideInFullscreen.toggle(); engine.applySettings() }
-    @objc func setIntensity(_ i: NSMenuItem) { Settings.shared.intensity = Intensity(rawValue: i.tag) ?? .normal; engine.updateRate() }
     /// Not trusted yet: show the system Accessibility prompt once per build. A rebuilt (ad-hoc signed)
     /// binary loses the earlier grant, so the key is the executable's build time. The menu item stays.
     func askDockAccessOncePerBuild() {
@@ -4100,11 +4152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = AXIsProcessTrustedWithOptions(options)
         DockGeometry.invalidate()
     }
-    @objc func plowNow() { engine.startPlow() }
-    @objc func debugSpawn() { engine.spawnDemoSnowmen() }
-    @objc func clearSnow() { engine.clearSnow() }
     @MainActor @objc func checkForUpdates() { updater?.checkForUpdates() }
-    @MainActor @objc func toggleAutoUpdates() { updater?.automaticallyChecksForUpdates.toggle() }
     @objc func quit() { NSApp.terminate(nil) }
 }
 
@@ -4113,6 +4161,11 @@ let app = NSApplication.shared
 if let i = CommandLine.arguments.firstIndex(of: "--showcase") {
     let dir = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : "showcase-out"
     Showcase.run(outDir: dir)
+    exit(0)
+}
+if let i = CommandLine.arguments.firstIndex(of: "--render-popover") {
+    let dir = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : "popover-out"
+    MainActor.assumeIsolated { PopoverRenderer.renderAll(to: dir) }
     exit(0)
 }
 let delegate = AppDelegate()
