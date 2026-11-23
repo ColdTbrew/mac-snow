@@ -45,7 +45,7 @@
 - **모닥불 모드**: 메뉴에서 **모닥불 모드**를 켜면 마우스 커서가 장작과 불꽃이 타오르는 모닥불로 바뀌어요. 커서를 쌓인 눈·고드름·눈사람·눈덩이 가까이로 가져가면 열기로 실시간으로 녹고, 녹은 눈이 맑은 물방울이 되어 창과 Dock 아래로 흘러내리며 아래 창에 닿으면 톡톡 튀어요. 모닥불이 켜진 동안에도 일반 클릭·창 드래그는 그대로 통과하고, 실수로 눈사람이 생기지 않도록 제목줄 클릭 눈사람 생성과 눈 굴리기는 잠시 쉬어요.
 - **배터리 절약**: 자동으로 두면 전원 어댑터가 빠져 있거나 저전력 모드일 때 눈 양과 갱신 횟수를 줄여요(폭설은 '많이'로 낮춰요). 항상 켜 두거나 끌 수도 있어요.
 - **로그인 시 자동 실행**: 메뉴에서 켜면 로그인할 때 MacSnow가 자동으로 실행돼요(`SMAppService`).
-- **자동 업데이트**: [Sparkle 2](https://sparkle-project.org/)로 GitHub Releases의 새 버전을 확인하고 바로 업데이트할 수 있어요. 메뉴바 ❄ > **업데이트 확인…**으로 수동 확인하거나 **자동 업데이트 확인**을 켜고 끌 수 있어요. (로컬 개발 빌드처럼 EdDSA 공개 키가 없는 빌드에서는 자동 확인이 비활성화돼요.)
+- **자동 업데이트**: [Sparkle 2](https://sparkle-project.org/)로 GitHub Releases의 새 버전을 확인하고 바로 업데이트할 수 있어요. 메뉴바 ❄ > **업데이트 확인…**으로 수동 확인하거나 **자동 업데이트 확인**을 켜고 끌 수 있어요. (v0.5.2부터 다시 동작해요. v0.5.0–0.5.1은 업데이트 키가 빠진 채 배포돼서, 그 버전을 쓰고 있다면 v0.5.2를 한 번 직접 내려받아 주세요.)
 - **제설차**: 노란 픽셀 제설차가 가끔 Dock 위를 지나가며 눈을 밀어요. 밀린 눈은 날 앞에 쐐기 모양으로 모여 같이 움직여요. 메뉴에서 바로 부를 수도 있어요.
 
 ## 스크린샷
@@ -194,22 +194,11 @@ v0.5.1 유휴 비용 줄이기 전/후 (같은 맥, 화면 잠금 상태에서 `
 
 - 앱 코드는 `Sources/main.swift`, 가상 화면 렌더러는 `Sources/Showcase.swift`예요.
 - `open build/MacSnow.app --args --demo`로 실행하면 처음 25초 동안 눈이 빨리 쌓여요(확인용).
-- 배포 파일 만들기: `./tools/release.sh 0.5.0` → `dist/MacSnow-0.5.0.dmg`, `.zip`, `SHA256SUMS.txt` (애드혹 서명). `SPARKLE_PUBLIC_ED_KEY`가 있으면 번들 `Info.plist`의 `SUPublicEDKey`에 주입하고, `SPARKLE_PRIVATE_ED_KEY`가 있으면 `dist/MacSnow-0.5.0.zip`을 EdDSA 서명해 `dist/appcast.xml`을 함께 만들어요. `v*` 태그를 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 맥에서 빌드해 릴리스에 올려요.
-- **Sparkle 자동 업데이트 키 설정 (최초 1회)**:
-  1. `./tools/fetch_sparkle.sh` 실행 후 키 쌍을 생성해요.
-     ```
-     ./build/deps/sparkle/bin/generate_keys
-     ```
-     출력되는 `<string>...</string>` 값이 공개 키(`SPARKLE_PUBLIC_ED_KEY`)예요.
-  2. CI용 개인 키를 임시 파일로 내보낸 뒤 읽고 즉시 삭제해요.
-     ```
-     ./build/deps/sparkle/bin/generate_keys -x /tmp/sparkle_ed_key
-     cat /tmp/sparkle_ed_key && rm -f /tmp/sparkle_ed_key
-     ```
-  3. GitHub 저장소 **Settings > Secrets and variables > Actions**에 아래 두 시크릿을 등록해요.
-     - `SPARKLE_PUBLIC_ED_KEY`: 1단계의 공개 키 (`Info.plist`의 `SUPublicEDKey`로 자동 주입)
-     - `SPARKLE_PRIVATE_ED_KEY`: 2단계의 개인 키 (`dist/appcast.xml` EdDSA 서명에 사용)
-  시크릿이 설정되지 않은 로컬 빌드나 `workflow_dispatch`에서도 오류 없이 빌드되며, `appcast.xml` 생성만 건너뛰어요.
+- 배포 파일 만들기: `./tools/release.sh 0.5.2` → `dist/MacSnow-0.5.2.dmg`, `.zip`, `SHA256SUMS.txt` (애드혹 서명). `SPARKLE_PRIVATE_ED_KEY`가 있으면 ZIP을 EdDSA 서명해 `dist/appcast.xml`을 함께 만들고, 그 서명이 번들의 `SUPublicEDKey`로 검증되는지 `tools/verify_update_sig.swift`로 확인해요(안 맞으면 실패). `v*` 태그를 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 맥에서 빌드해 릴리스에 올리고, `appcast.xml`이 없으면 릴리스를 실패시켜요.
+- **Sparkle 자동 업데이트 키**: 공개 키는 `Info.plist`의 `SUPublicEDKey`에 들어 있어서 로컬 빌드도 업데이트 확인이 돼요(`SPARKLE_PUBLIC_ED_KEY` 환경 변수로 덮어쓸 수 있어요). 개인 키는 저장소 시크릿 `SPARKLE_PRIVATE_ED_KEY`에만 있어요. 키를 바꿔야 하면:
+  1. `./tools/fetch_sparkle.sh` 후 `./build/deps/sparkle/bin/generate_keys --account mac-snow`로 키를 만들고(개인 키는 로그인 키체인에 저장), 출력된 공개 키로 `Info.plist`의 `SUPublicEDKey`를 바꿔요.
+  2. `generate_keys --account mac-snow -x <임시 파일>`로 개인 키를 내보내 `gh secret set SPARKLE_PRIVATE_ED_KEY < <임시 파일>`로 등록하고 임시 파일은 바로 지워요. 개인 키를 화면이나 로그에 출력하지 마세요.
+  3. 키를 바꾸면 이전 공개 키를 가진 설치본은 새 업데이트를 거부하니, 이전 버전 사용자는 한 번 직접 내려받아야 해요.
 - `tools/notify.sh`: 실행 중인 앱에 디버그 신호를 보내요.
   `plow`(제설차), `spawn`(눈사람), `jump`, `shake`(앞 창 눈 털기), `campfire`(모닥불 모드 전환), `clear`, `fill`(눈 가득), `roll`(눈 굴리기 시연), `dump`(상태를 `$TMPDIR/macsnow-debug.txt`에 기록), `fast`(12초간 드래그 중인 것처럼 60Hz)
 - 스크린샷·데모 다시 만들기: 실제 화면은 캡처하지 않고 가상 화면에 시나리오(눈 쌓임 → 창 드래그 → 눈 굴리기 → 눈사람 점프 → 창 닫기 → 창 좁히기·눈 낙하 → Dock 폭 변경 → 제설차)를 돌려 PNG로 저장해요.
