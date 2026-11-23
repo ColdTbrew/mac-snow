@@ -396,12 +396,17 @@ final class Pile {
         dirty = true
     }
 
-    func relax() {
-        guard heights.count > 2 else { return }
+    @discardableResult func relax() -> Bool {
+        guard heights.count > 2 else { return false }
         var h = heights
-        for i in 1..<(h.count - 1) { h[i] += ((heights[i - 1] + heights[i + 1]) / 2 - heights[i]) * 0.15 }
+        var changed = false
+        for i in 1..<(h.count - 1) {
+            h[i] += ((heights[i - 1] + heights[i + 1]) / 2 - heights[i]) * 0.15
+            if abs(h[i] - heights[i]) > 0.01 { changed = true }
+        }
         heights = h
-        dirty = true
+        if changed { dirty = true }
+        return changed
     }
     func height(at x: CGFloat) -> CGFloat {
         let i = Int(x / Pile.step)
@@ -1291,6 +1296,10 @@ final class Engine {
     var spawnDebt: CGFloat = 0
     var pileDirty = true
     var geometryChanged = true
+    var lastGeometryChange: CFTimeInterval = -.infinity
+    var lastGeometryPoll: CFTimeInterval = -.infinity
+    lazy var lastRelax = clock()
+    lazy var lastPrune = clock()
     var tickCount = 0
     var demoBoost: CGFloat = 1
     var mouseIsDown = false
@@ -1446,8 +1455,8 @@ final class Engine {
     }
 
     /// Tick only as fast as needed: 60 Hz while the mouse is down (drag / rolling),
-    /// 30 Hz while something animates on the CPU side, 10 Hz (5 in Low Power) for snowfall,
-    /// 4 Hz when only resting snow has to follow windows, 1 Hz otherwise, and nothing while paused.
+    /// 30 Hz while something animates on the CPU side, 4 Hz for snowfall,
+    /// 2–4 Hz when only resting snow has to follow windows, 1 Hz otherwise, and nothing while paused.
     func desiredInterval() -> Double? {
         if paused { return nil }
         if mouseIsDown || forceFast { return lowPower ? 1.0 / 30 : 1.0 / 60 }
@@ -1456,8 +1465,8 @@ final class Engine {
             return lowPower ? 1.0 / 20 : 1.0 / 30
         }
         if !overlays.isEmpty && fullscreenOverlays.count == overlays.count { return 0.5 }
-        if Settings.shared.snowOn || !flakes.isEmpty { return lowPower ? 1.0 / 4 : 1.0 / 8 }
-        if !props.isEmpty || piles.values.contains(where: { $0.mean > 0.05 }) { return 1.0 / 4 }
+        if Settings.shared.snowOn || !flakes.isEmpty { return 1.0 / 4 }
+        if !props.isEmpty || piles.values.contains(where: { $0.mean > 0.05 }) { return clock() - lastGeometryChange < 2 ? 1.0 / 4 : 1.0 / 2 }
         return 1.0
     }
 
@@ -1505,8 +1514,13 @@ final class Engine {
         if let source = powerSource { CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes) }
         updatePower()
         let ws = NSWorkspace.shared.notificationCenter
-        for n in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification] {
-            ws.addObserver(forName: n, object: nil, queue: .main) { _ in DockGeometry.invalidate() }   // Dock width changes
+        for n in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didActivateApplicationNotification] {
+            ws.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in
+                if n != NSWorkspace.didActivateApplicationNotification { DockGeometry.invalidate() }   // Dock width changes
+                guard let self else { return }
+                self.lastGeometryChange = self.clock()
+                self.refreshGeometry()
+            }
         }
         for (n, pause) in [(NSWorkspace.screensDidSleepNotification, true), (NSWorkspace.screensDidWakeNotification, false),
                            (NSWorkspace.sessionDidResignActiveNotification, true), (NSWorkspace.sessionDidBecomeActiveNotification, false)] {
@@ -1636,6 +1650,7 @@ final class Engine {
     /// Full window list (~1 ms on a busy desktop). During a drag we only re-read the dragged
     /// window every frame (refreshDragged) and do the full list ~8 times a second.
     func refreshGeometry() {
+        lastGeometryPoll = clock()
         var list = windowSource.fetch()
         geometryReads += 1
         setExpose(windowSource.exposeActive)
@@ -1818,6 +1833,9 @@ final class Engine {
     }
 
     func applyWins(_ list: [Win]) {
+        if !list.elementsEqual(wins, by: { $0.id == $1.id && $0.frame == $1.frame && $0.z == $1.z && $0.surface == $1.surface }) {
+            lastGeometryChange = clock()
+        }
         wins = list
         if lagLog != nil, let id = downWin?.id, let w = list.first(where: { $0.id == id }), w.frame.origin != lagLast {
             lagLast = w.frame.origin
@@ -1836,6 +1854,7 @@ final class Engine {
             }
         }
         if s != surfaces {
+            lastGeometryChange = clock()
             let previous = surfaces
             surfaces = s
             orderedSurfaces = s.values.sorted { $0.top > $1.top }
@@ -1891,13 +1910,13 @@ final class Engine {
         last = now
 
         // window bounds: mouse down -> the window under the cursor every frame (60 Hz) + full list
-        // ~8 Hz; otherwise the full list ~4 Hz whatever the tick rate
+        // ~8 Hz; otherwise the full list ~4 Hz after geometry changes, ~2 Hz when settled
         if let d = drag, d.confirmed {
             if tickCount % 4 == 0 { reconcileDrag() }          // ~15 Hz check against the window list
             if tickCount % 8 == 0 { refreshGeometry() }
         } else if mouseIsDown || forceFast {
             if tickCount % 8 == 0 { refreshGeometry() } else { refreshDragged() }
-        } else if tickCount % max(1, Int(0.25 / max(interval, 0.001))) == 0 { refreshGeometry() }
+        } else if now - lastGeometryPoll >= (now - lastGeometryChange < 2 ? 0.25 : 0.5) { refreshGeometry() }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         if virtualNow == nil, !paused, now - lastMelt >= 2 {
             let elapsed = now - lastMelt; lastMelt = now
@@ -1907,9 +1926,14 @@ final class Engine {
         updateSpills(dt: dt)
         updateWaterDrops(dt: dt)
         updateCampfire(dt: dt, now: now)
-        if tickCount % 10 == 0 { for p in piles.values where p.mean > 0.05 { p.relax() }; pileDirty = true }
+        // every ~10 ticks while fast (drag / animations, as before), at most every 1.25 s when slow
+        if now - lastRelax >= min(1.25, 10 * Double(dt)) {
+            lastRelax = now
+            for p in piles.values where p.mean > 0.05 { if p.relax() { pileDirty = true } }
+        }
         if virtualNow == nil, now - lastSave > 30 { saveState() }
-        if tickCount % 120 == 0 {
+        if now - lastPrune >= min(15, 120 * Double(dt)) {
+            lastPrune = now
             let cutoff = Date().addingTimeInterval(-3), keepFor = Date().addingTimeInterval(-6 * 3600)
             piles = piles.filter {
                 surfaces[$0.key] != nil || $0.value.lastSeen > cutoff || ($0.value.lastSeen > keepFor && hostAlive($0.key))
@@ -3858,7 +3882,7 @@ final class Engine {
         let settings = Settings.shared
         out += "settings intensity=\(settings.intensity.rawValue) wind=\(settings.windOn)/\(settings.windStrength) melt=\(settings.meltOn)/\(settings.meltSpeed) campfire=\(settings.campfireOn) battery=\(settings.batteryMode.rawValue) lowPower=\(lowPower) onAC=\(onAC) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled) login=\(SMAppService.mainApp.status.rawValue)\n"
         out += "wind gusts=\(windGusts) pushed=\(windPushed) dust=\(windDust) campfireDrops=\(meltDrops.count) campfireSparks=\(campfireSparks.count)\n"
-        out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1) fullscreen=\(fullscreenOverlays.sorted()) hideFS=\(settings.hideInFullscreen)\n"
+        out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) lastGeometryChange age=\(clock() - lastGeometryChange) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1) fullscreen=\(fullscreenOverlays.sorted()) hideFS=\(settings.hideInFullscreen)\n"
         out += "shake on=\(settings.shakeOn) strength=\(settings.shakeStrength.rawValue) jolts=\(shakeJolts) sheds=\(shakeSheds) drags=\(dragCount)\n"
         for (k, p) in piles where k < Engine.dockKey(0) {
             let lengths = p.icicles.map(\.length).filter { $0 > 0 }
