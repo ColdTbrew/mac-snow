@@ -45,6 +45,7 @@ if [ -n "${SPARKLE_PRIVATE_ED_KEY:-}" ]; then
   ZIP_LEN="$(stat -f%z "$ZIP")"
   PUB_DATE="$(LC_ALL=C date -u "+%a, %d %b %Y %H:%M:%S +0000")"
   ED_SIG="$(printf '%s' "$SPARKLE_PRIVATE_ED_KEY" | "$SPARKLE_DIR/bin/sign_update" --ed-key-file - -p "$ZIP")"
+  [ -n "$ED_SIG" ] || { echo "sign_update가 서명을 만들지 못했어요" >&2; exit 1; }
   cat > dist/appcast.xml <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -69,6 +70,10 @@ if [ -n "${SPARKLE_PRIVATE_ED_KEY:-}" ]; then
   </channel>
 </rss>
 EOF
+  # 서명이 앱에 들어간 SUPublicEDKey로 검증되는지 확인 (키가 안 맞으면 업데이트가 거부돼요)
+  APP_PUB="$(/usr/libexec/PlistBuddy -c "Print :SUPublicEDKey" "$APP/Contents/Info.plist")"
+  [ -n "$APP_PUB" ] || { echo "SUPublicEDKey가 비어 있어요" >&2; exit 1; }
+  swift tools/verify_update_sig.swift "$APP_PUB" "$ZIP" "$ED_SIG"
   echo "generated dist/appcast.xml"
 else
   echo "note: SPARKLE_PRIVATE_ED_KEY is not set; skipping dist/appcast.xml generation."

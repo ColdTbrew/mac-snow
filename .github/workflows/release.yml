@@ -14,11 +14,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: 빌드·패키징
         env:
-          SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
           SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
         run: |
           if [ "${{ github.ref_type }}" = "tag" ]; then VER="${GITHUB_REF_NAME#v}"; else VER="0.0.0-ci"; fi
           ./tools/release.sh "$VER" "${{ github.run_number }}"
+          # 태그 릴리스는 자동 업데이트 피드(appcast.xml)가 꼭 있어야 해요
+          if [ "${{ github.ref_type }}" = "tag" ] && [ ! -s dist/appcast.xml ]; then
+            echo "dist/appcast.xml이 없어요 (SPARKLE_PRIVATE_ED_KEY 시크릿 확인)" >&2; exit 1
+          fi
           lipo -archs build/MacSnow.app/Contents/MacOS/MacSnow
       - uses: actions/upload-artifact@v4
         with:
@@ -36,8 +39,5 @@ jobs:
           if gh release view "$TAG" --json assets -q '.assets[].name' | grep -q '\.dmg$'; then
             echo "이미 DMG가 있어서 올리지 않아요"; exit 0
           fi
-          ASSETS=(dist/*.dmg dist/*.zip dist/SHA256SUMS.txt)
-          if [ -f dist/appcast.xml ]; then
-            ASSETS+=(dist/appcast.xml)
-          fi
+          ASSETS=(dist/*.dmg dist/*.zip dist/SHA256SUMS.txt dist/appcast.xml)
           gh release upload "$TAG" "${ASSETS[@]}"
