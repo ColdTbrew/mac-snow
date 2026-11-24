@@ -386,7 +386,6 @@ private struct FallbackGlassCard: ViewModifier {
                         lineWidth: 0.5
                     )
             )
-            .shadow(color: Color.black.opacity(isDark ? 0.32 : 0.12), radius: 14, y: 6)
     }
 }
 
@@ -405,16 +404,31 @@ private extension View {
 
 struct MenuPopoverView: View {
     static let contentWidth: CGFloat = 342
-    static let outerPadding: CGFloat = 14
+    private static let cornerRadius: CGFloat = 24
 
     @ObservedObject var model: MenuModel
     var useFallbackGlass: Bool = false
+    var scrollHeight: CGFloat?
     @Environment(\.colorScheme) private var colorScheme
 
     private var isDark: Bool { colorScheme == .dark }
     private var dividerColor: Color { Color.primary.opacity(isDark ? 0.12 : 0.08) }
 
     var body: some View {
+        Group {
+            if let scrollHeight {
+                ScrollView { settingsContent }
+                    .frame(height: scrollHeight)
+            } else {
+                settingsContent
+            }
+        }
+        .frame(width: Self.contentWidth)
+        .glassSurface(cornerRadius: Self.cornerRadius, useFallback: useFallbackGlass)
+        .clipShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
+    }
+
+    private var settingsContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             heroHeader
             quickActionsRow
@@ -433,9 +447,7 @@ struct MenuPopoverView: View {
             footerBar
         }
         .padding(12)
-        .frame(width: Self.contentWidth)
-        .glassSurface(cornerRadius: 24, useFallback: useFallbackGlass)
-        .padding(Self.outerPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var sectionDivider: some View {
@@ -471,6 +483,7 @@ struct MenuPopoverView: View {
                 PillSwitch(
                     isOn: Binding(get: { model.snowOn }, set: { model.setSnowOn($0) }),
                     tint: .winterBlue,
+                    title: "눈 내리기",
                     size: .regular
                 )
             }
@@ -605,7 +618,7 @@ struct MenuPopoverView: View {
                 enabled: model.windOn,
                 tint: .winterBlue
             ) { model.setWindStrength($0) }
-            SwitchControl(isOn: Binding(get: { model.windOn }, set: { model.setWindOn($0) }), tint: .winterBlue)
+            SwitchControl(isOn: Binding(get: { model.windOn }, set: { model.setWindOn($0) }), tint: .winterBlue, title: "마우스 바람")
         }
         SettingRow(icon: "arrow.left.and.right", iconColor: .shakeIndigo, title: "창 흔들어 털기") {
             MiniChoicePill(
@@ -614,7 +627,7 @@ struct MenuPopoverView: View {
                 enabled: model.shakeOn,
                 tint: .shakeIndigo
             ) { model.setShakeStrength(ShakeStrength(rawValue: $0) ?? .normal) }
-            SwitchControl(isOn: Binding(get: { model.shakeOn }, set: { model.setShakeOn($0) }), tint: .shakeIndigo)
+            SwitchControl(isOn: Binding(get: { model.shakeOn }, set: { model.setShakeOn($0) }), tint: .shakeIndigo, title: "창 흔들어 털기")
         }
         SettingRow(icon: "drop.fill", iconColor: .meltCyan, title: "녹기 · 고드름") {
             MiniChoicePill(
@@ -623,23 +636,23 @@ struct MenuPopoverView: View {
                 enabled: model.meltOn,
                 tint: .meltCyan
             ) { model.setMeltSpeed($0) }
-            SwitchControl(isOn: Binding(get: { model.meltOn }, set: { model.setMeltOn($0) }), tint: .meltCyan)
+            SwitchControl(isOn: Binding(get: { model.meltOn }, set: { model.setMeltOn($0) }), tint: .meltCyan, title: "녹기 · 고드름")
         }
         SettingRow(icon: "snowman", useSnowmanGlyph: true, iconColor: .snowmanTeal, title: "눈사람 만들기", subtitle: "제목줄 클릭 · 굴리기") {
-            SwitchControl(isOn: Binding(get: { model.snowmenOn }, set: { model.setSnowmenOn($0) }), tint: .snowmanTeal)
+            SwitchControl(isOn: Binding(get: { model.snowmenOn }, set: { model.setSnowmenOn($0) }), tint: .snowmanTeal, title: "눈사람 만들기")
         }
         SettingRow(icon: safeSymbol("bus.fill", "car.fill"), iconColor: .plowAmber, title: "제설차 자동") {
-            SwitchControl(isOn: Binding(get: { model.autoPlow }, set: { model.setAutoPlow($0) }), tint: .plowAmber)
+            SwitchControl(isOn: Binding(get: { model.autoPlow }, set: { model.setAutoPlow($0) }), tint: .plowAmber, title: "제설차 자동")
         }
     }
 
     @ViewBuilder
     private var systemRows: some View {
         SettingRow(icon: "square.stack.3d.up.fill", iconColor: .layerPurple, title: "눈송이 창 위로") {
-            SwitchControl(isOn: Binding(get: { model.flakesOnTop }, set: { model.setFlakesOnTop($0) }), tint: .layerPurple)
+            SwitchControl(isOn: Binding(get: { model.flakesOnTop }, set: { model.setFlakesOnTop($0) }), tint: .layerPurple, title: "눈송이 창 위로")
         }
         SettingRow(icon: safeSymbol("rectangle.inset.filled", "macwindow"), iconColor: .screenSlate, title: "전체화면에서 숨기기") {
-            SwitchControl(isOn: Binding(get: { model.hideInFullscreen }, set: { model.setHideInFullscreen($0) }), tint: .winterBlue)
+            SwitchControl(isOn: Binding(get: { model.hideInFullscreen }, set: { model.setHideInFullscreen($0) }), tint: .winterBlue, title: "전체화면에서 숨기기")
         }
         SettingRow(icon: "leaf.fill", iconColor: .leafGreen, title: "배터리 절약") {
             MiniChoicePill(
@@ -650,11 +663,11 @@ struct MenuPopoverView: View {
             ) { model.setBatteryMode(BatteryMode(rawValue: $0) ?? .auto) }
         }
         SettingRow(icon: "power", iconColor: .winterBlue, title: "로그인 시 자동 실행") {
-            SwitchControl(isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }), tint: .winterBlue)
+            SwitchControl(isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }), tint: .winterBlue, title: "로그인 시 자동 실행")
         }
         SettingRow(icon: safeSymbol("arrow.triangle.2.circlepath", "arrow.clockwise"), iconColor: .snowmanTeal, title: "자동 업데이트") {
             if model.updaterConfigured {
-                SwitchControl(isOn: Binding(get: { model.autoUpdateOn }, set: { model.setAutoUpdateOn($0) }), tint: .snowmanTeal)
+                SwitchControl(isOn: Binding(get: { model.autoUpdateOn }, set: { model.setAutoUpdateOn($0) }), tint: .snowmanTeal, title: "자동 업데이트")
             } else {
                 Text("키 없음")
                     .font(.system(size: 10.5, weight: .medium))
@@ -874,6 +887,7 @@ private struct PillSwitch: View {
     enum Size { case regular, mini }
     @Binding var isOn: Bool
     let tint: Color
+    let title: String
     var size: Size = .mini
 
     @Environment(\.colorScheme) private var colorScheme
@@ -902,15 +916,18 @@ private struct PillSwitch: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(Text(title))
+        .accessibilityValue(Text(isOn ? "켜짐" : "꺼짐"))
     }
 }
 
 private struct SwitchControl: View {
     @Binding var isOn: Bool
     let tint: Color
+    let title: String
 
     var body: some View {
-        PillSwitch(isOn: $isOn, tint: tint, size: .mini)
+        PillSwitch(isOn: $isOn, tint: tint, title: title, size: .mini)
     }
 }
 
@@ -1043,7 +1060,7 @@ enum PopoverRenderer {
 
         let hosting = NSHostingView(rootView: rootView)
         hosting.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
-        let width = MenuPopoverView.contentWidth + MenuPopoverView.outerPadding * 2
+        let width = MenuPopoverView.contentWidth
         let fitting = hosting.fittingSize
         let size = NSSize(width: width, height: ceil(fitting.height))
         hosting.frame = NSRect(origin: .zero, size: size)

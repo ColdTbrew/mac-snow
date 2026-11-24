@@ -912,7 +912,7 @@ final class CampfireVisual {
         root.addSublayer(outerFlame)
         root.addSublayer(midFlame)
         root.addSublayer(innerFlame)
-        update(phase: 0, velocity: .zero)
+        update(phase: 0, velocity: .zero, flame: 1)
     }
 
     private func flamePath(baseX: CGFloat = 0, baseY: CGFloat, halfW: CGFloat, height: CGFloat, tipX: CGFloat, bellyShift: CGFloat) -> CGPath {
@@ -944,8 +944,9 @@ final class CampfireVisual {
         return p
     }
 
-    func update(phase: CGFloat, velocity: CGPoint) {
+    func update(phase: CGFloat, velocity: CGPoint, flame: CGFloat) {
         let s = S
+        let heightScale = 0.24 + 0.76 * flame
         let leanX = max(-14 * s, min(14 * s, -velocity.x * 0.018))
         let stretchY = max(-3.5 * s, min(5.5 * s, -velocity.y * 0.005))
 
@@ -957,23 +958,27 @@ final class CampfireVisual {
         let pulse3 = 1 + 0.13 * cos(phase * 16.1 + 1.7)
 
         let outer = CGMutablePath()
-        outer.addPath(flamePath(baseY: -4.8 * s, halfW: 9.2 * s, height: (24.5 * s + stretchY) * pulse1,
+        outer.addPath(flamePath(baseY: -4.8 * s, halfW: 9.2 * s, height: (24.5 * s + stretchY) * pulse1 * heightScale,
                                 tipX: leanX + sway1, bellyShift: leanX * 0.25 + sway1 * 0.3))
-        let leftLickH = (11.5 + 2.2 * sin(phase * 12.1 + 0.4)) * s
+        let leftLickH = (11.5 + 2.2 * sin(phase * 12.1 + 0.4)) * s * heightScale
         outer.addPath(flamePath(baseX: -4.5 * s, baseY: -4.6 * s, halfW: 3.3 * s, height: leftLickH,
                                 tipX: -2.0 * s + leanX * 0.65 + sway2 * 0.7, bellyShift: -0.8 * s + leanX * 0.15))
-        let rightLickH = (10.5 + 2.0 * cos(phase * 13.3 + 1.5)) * s
+        let rightLickH = (10.5 + 2.0 * cos(phase * 13.3 + 1.5)) * s * heightScale
         outer.addPath(flamePath(baseX: 4.5 * s, baseY: -4.6 * s, halfW: 3.1 * s, height: rightLickH,
                                 tipX: 1.8 * s + leanX * 0.65 - sway2 * 0.6, bellyShift: 0.8 * s + leanX * 0.15))
         outerFlame.path = outer
 
-        midFlame.path = flamePath(baseY: -4.4 * s, halfW: 6.4 * s, height: (17.5 * s + stretchY * 0.65) * pulse2,
+        midFlame.path = flamePath(baseY: -4.4 * s, halfW: 6.4 * s, height: (17.5 * s + stretchY * 0.65) * pulse2 * heightScale,
                                   tipX: leanX * 0.72 + sway2, bellyShift: leanX * 0.18 + sway2 * 0.25)
-        innerFlame.path = flamePath(baseY: -4.0 * s, halfW: 3.5 * s, height: (10.5 * s + stretchY * 0.35) * pulse3,
+        innerFlame.path = flamePath(baseY: -4.0 * s, halfW: 3.5 * s, height: (10.5 * s + stretchY * 0.35) * pulse3 * heightScale,
                                     tipX: leanX * 0.42 + sway3, bellyShift: leanX * 0.10 + sway3 * 0.2)
 
         let glowPulse = 0.94 + 0.08 * sin(phase * 5.3) + 0.04 * cos(phase * 9.7)
-        glow.opacity = Float(0.80 + 0.18 * sin(phase * 4.7) * cos(phase * 2.3))
+        let flameOpacity = Float(0.22 + 0.78 * flame)
+        outerFlame.opacity = flameOpacity
+        midFlame.opacity = flameOpacity
+        innerFlame.opacity = flameOpacity
+        glow.opacity = Float((0.80 + 0.18 * sin(phase * 4.7) * cos(phase * 2.3)) * (0.15 + 0.85 * flame))
         glow.setAffineTransform(CGAffineTransform(scaleX: glowPulse, y: glowPulse))
         coalGlow.opacity = Float(0.70 + 0.28 * (0.5 + 0.5 * sin(phase * 6.4)))
     }
@@ -1308,6 +1313,8 @@ final class Engine {
     var campfireLastPoint: CGPoint?
     var campfireVel: CGPoint = .zero
     var campfirePhase: CGFloat = 0
+    var campfireFlame: CGFloat = 1
+    private var campfireGustUntil: CFTimeInterval = 0
     var campfireMelting = false
     var meltDrops: [MeltDrop] = []
     var meltDropPool: [CALayer] = []
@@ -1839,7 +1846,7 @@ final class Engine {
     }
 
     func applyOverlayVisibility(animated: Bool = true) {
-        let showCampfire = campfirePoint.map { shouldShowCampfire(at: $0) } ?? false
+        let showCampfire = campfirePoint.flatMap { campfireOverlay(at: $0) } != nil
         campfireVisual?.root.isHidden = !showCampfire
         if !showCampfire { setCampfireCursorHidden(false) }
         for (i, o) in overlays.enumerated() {
@@ -3245,24 +3252,23 @@ final class Engine {
         }
     }
 
-    private func shouldShowCampfire(at p: CGPoint) -> Bool {
-        guard Settings.shared.campfireOn, !paused, !expose, !overlays.isEmpty,
-              p.x.isFinite, p.y.isFinite, !isFullscreen(at: p) else { return false }
+    private func campfireOverlay(at p: CGPoint) -> Overlay? {
+        guard Settings.shared.campfireOn, !paused, !expose, p.x.isFinite, p.y.isFinite,
+              !isFullscreen(at: p), let o = overlays.first(where: { $0.frame.contains(p) }) else { return nil }
         if virtualNow == nil {
-            let o = overlays[overlayIndex(for: p)]
             if o.clip.frame.height < o.frame.height - 1 && p.y >= o.frame.minY + o.clip.frame.height - 2 {
-                return false
+                return nil
             }
-            if isPointInOwnPopup(p) { return false }
-            if popupFrames.contains(where: { $0.contains(p) }) { return false }
+            if isPointInOwnPopup(p) { return nil }
+            if popupFrames.contains(where: { $0.contains(p) }) { return nil }
         }
-        return true
+        return o
     }
 
     func updateCampfirePointer(at p: CGPoint) {
         guard Settings.shared.campfireOn, p.x.isFinite, p.y.isFinite else { return }
         campfirePoint = p
-        guard shouldShowCampfire(at: p) else {
+        guard let o = campfireOverlay(at: p) else {
             campfireVisual?.root.isHidden = true
             setCampfireCursorHidden(false)
             return
@@ -3270,7 +3276,6 @@ final class Engine {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         let vis = campfireVisual ?? CampfireVisual()
         campfireVisual = vis
-        let o = overlays[overlayIndex(for: p)]
         if vis.parent !== o.actors {
             vis.root.removeFromSuperlayer()
             o.actors.addSublayer(vis.root)
@@ -3294,12 +3299,14 @@ final class Engine {
             setCampfireCursorHidden(false)
             campfireVel = .zero
             campfireLastPoint = nil
+            campfireFlame = 1
+            campfireGustUntil = 0
             return
         }
         if virtualNow == nil {
             campfirePoint = NSEvent.mouseLocation
         }
-        guard let p = campfirePoint, shouldShowCampfire(at: p) else {
+        guard let p = campfirePoint, let o = campfireOverlay(at: p) else {
             campfireVisual?.root.isHidden = true
             setCampfireCursorHidden(false)
             campfireVel = .zero
@@ -3309,6 +3316,10 @@ final class Engine {
 
         if let prev = campfireLastPoint, dt > 0.001 {
             let raw = CGPoint(x: (p.x - prev.x) / dt, y: (p.y - prev.y) / dt)
+            if hypot(raw.x, raw.y) >= 1050 * S {
+                // Keep the flame low through the brief pause at each reversal.
+                campfireGustUntil = now + 0.14
+            }
             let alpha = min(1, dt * 14)
             campfireVel = CGPoint(x: campfireVel.x + (raw.x - campfireVel.x) * alpha,
                                   y: campfireVel.y + (raw.y - campfireVel.y) * alpha)
@@ -3316,10 +3327,13 @@ final class Engine {
             campfireVel = .zero
         }
         campfireLastPoint = p
+        let gust = now < campfireGustUntil
+        let target: CGFloat = gust ? 0 : 1
+        let response: CGFloat = gust ? 0.075 : 0.23
+        campfireFlame += (target - campfireFlame) * (1 - exp(-dt / response))
 
         let vis = campfireVisual ?? CampfireVisual()
         campfireVisual = vis
-        let o = overlays[overlayIndex(for: p)]
         if vis.parent !== o.actors {
             vis.root.removeFromSuperlayer()
             o.actors.addSublayer(vis.root)
@@ -3329,10 +3343,10 @@ final class Engine {
         vis.root.position = o.local(p)
         setCampfireCursorHidden(true)
         campfirePhase += dt
-        vis.update(phase: campfirePhase, velocity: campfireVel)
+        vis.update(phase: campfirePhase, velocity: campfireVel, flame: campfireFlame)
 
         // Rising ember sparks (capped at 25)
-        sparkDebt += (lowPower ? 7 : 12) * dt
+        sparkDebt += (lowPower ? 7 : 12) * dt * campfireFlame
         while sparkDebt >= 1 {
             sparkDebt -= 1
             if campfireSparks.count >= 25 { sparkDebt = 0; break }
@@ -4128,7 +4142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hostingController = NSHostingController(rootView: MenuPopoverView(model: menuModel))
 
         panel = FloatingMenuPanel(
-            contentRect: NSRect(x: 0, y: 0, width: MenuPopoverView.contentWidth + MenuPopoverView.outerPadding * 2, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: MenuPopoverView.contentWidth, height: 500),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -4175,10 +4189,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let b = item.button else { return }
         openGeneration += 1
         menuModel.refresh()
+        hostingController.rootView = MenuPopoverView(model: menuModel)
         hostingController.view.layoutSubtreeIfNeeded()
-        let pad = MenuPopoverView.outerPadding
-        let width = MenuPopoverView.contentWidth + pad * 2
-        let size = NSSize(width: width, height: ceil(hostingController.view.fittingSize.height))
+        let width = MenuPopoverView.contentWidth
+        let naturalHeight = ceil(hostingController.view.fittingSize.height)
         let buttonRect: NSRect = if let btnWin = b.window {
             btnWin.convertToScreen(b.convert(b.bounds, to: nil))
         } else {
@@ -4188,11 +4202,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ?? NSScreen.main ?? NSScreen.screens.first
         if let screen {
             let vf = screen.visibleFrame
-            var x = buttonRect.midX - size.width / 2
-            x = max(vf.minX + 8 - pad, min(x, vf.maxX - size.width - 8 + pad))
-            var y = buttonRect.minY - 6 - size.height + pad
-            y = max(vf.minY + 8 - pad, y)
-            panel.setFrame(NSRect(x: round(x), y: round(y), width: size.width, height: size.height), display: true)
+            let top = min(vf.maxY, buttonRect.minY - 6)
+            let height = min(naturalHeight, max(1, floor(top - vf.minY - 8)))
+            if height < naturalHeight {
+                hostingController.rootView = MenuPopoverView(model: menuModel, scrollHeight: height)
+            }
+            let x = max(vf.minX + 8, min(buttonRect.midX - width / 2, vf.maxX - width - 8))
+            panel.setFrame(NSRect(x: round(x), y: round(top - height), width: width, height: height), display: true)
         }
         panel.alphaValue = 0
         NSApp.activate(ignoringOtherApps: true)
