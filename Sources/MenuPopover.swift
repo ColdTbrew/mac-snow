@@ -357,7 +357,7 @@ private struct FallbackGlassCard: ViewModifier {
 
     func body(content: Content) -> some View {
         let baseFill: AnyShapeStyle = offscreen
-            ? AnyShapeStyle(Color(white: isDark ? 0.14 : 0.98).opacity(isDark ? 0.74 : 0.78))
+            ? AnyShapeStyle(Color(white: isDark ? 0.14 : 0.98).opacity(isDark ? 0.80 : 0.84))
             : AnyShapeStyle(.ultraThinMaterial)
         return content
             .background(
@@ -377,57 +377,16 @@ private struct FallbackGlassCard: ViewModifier {
                     .strokeBorder(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(isDark ? 0.30 : 0.72),
-                                Color.primary.opacity(isDark ? 0.14 : 0.09)
+                                Color.white.opacity(isDark ? 0.22 : 0.55),
+                                Color.primary.opacity(isDark ? 0.10 : 0.06)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         ),
-                        lineWidth: 0.75
+                        lineWidth: 0.5
                     )
             )
-            .shadow(color: Color.black.opacity(isDark ? 0.28 : 0.10), radius: 10, y: 4)
-    }
-}
-
-private struct FallbackGlassCapsule: ViewModifier {
-    let tint: Color?
-    let offscreen: Bool
-    @Environment(\.colorScheme) private var colorScheme
-    private var isDark: Bool { colorScheme == .dark }
-
-    func body(content: Content) -> some View {
-        let baseFill: AnyShapeStyle = offscreen
-            ? AnyShapeStyle(Color(white: isDark ? 0.14 : 0.98).opacity(isDark ? 0.74 : 0.78))
-            : AnyShapeStyle(.ultraThinMaterial)
-        return content
-            .background(
-                Capsule(style: .continuous)
-                    .fill(baseFill)
-            )
-            .overlay(
-                Group {
-                    if let tint {
-                        Capsule(style: .continuous)
-                            .fill(tint.opacity(isDark ? 0.58 : 0.48))
-                    }
-                }
-            )
-            .overlay(
-                Capsule(style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [
-                                Color.white.opacity(isDark ? 0.30 : 0.72),
-                                Color.primary.opacity(isDark ? 0.14 : 0.09)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        ),
-                        lineWidth: 0.75
-                    )
-            )
-            .shadow(color: Color.black.opacity(isDark ? 0.25 : 0.09), radius: 8, y: 3)
+            .shadow(color: Color.black.opacity(isDark ? 0.32 : 0.12), radius: 14, y: 6)
     }
 }
 
@@ -442,28 +401,6 @@ private extension View {
             self.modifier(FallbackGlassCard(cornerRadius: cornerRadius, tint: tint, offscreen: useFallback))
         }
     }
-
-    @ViewBuilder
-    func glassCapsule(tint: Color? = nil, interactive: Bool = false, useFallback: Bool = false) -> some View {
-        if !useFallback, #available(macOS 26.0, *) {
-            let tinted = tint.map { Glass.regular.tint($0) } ?? Glass.regular
-            let glass = interactive ? tinted.interactive() : tinted
-            self.glassEffect(glass, in: Capsule())
-        } else {
-            self.modifier(FallbackGlassCapsule(tint: tint, offscreen: useFallback))
-        }
-    }
-}
-
-@ViewBuilder
-private func glassCluster<Content: View>(spacing: CGFloat, useFallback: Bool = false, @ViewBuilder content: () -> Content) -> some View {
-    if !useFallback, #available(macOS 26.0, *) {
-        GlassEffectContainer(spacing: spacing) {
-            content()
-        }
-    } else {
-        content()
-    }
 }
 
 struct MenuPopoverView: View {
@@ -475,31 +412,40 @@ struct MenuPopoverView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     private var isDark: Bool { colorScheme == .dark }
-    private var dividerColor: Color { Color.primary.opacity(isDark ? 0.10 : 0.07) }
+    private var dividerColor: Color { Color.primary.opacity(isDark ? 0.12 : 0.08) }
 
     var body: some View {
-        glassCluster(spacing: 10, useFallback: useFallbackGlass) {
-            VStack(alignment: .leading, spacing: 10) {
-                heroCard
-                quickActionsRow
-                glassSection(title: "효과 · 인터랙션") {
-                    effectRows
-                }
-                glassSection(title: "화면 · 시스템") {
-                    systemRows
-                }
-                if !model.axTrusted {
-                    accessibilityBanner
-                }
-                footerBar
+        VStack(alignment: .leading, spacing: 10) {
+            heroHeader
+            quickActionsRow
+            sectionDivider
+            sectionBlock(title: "효과 · 인터랙션") {
+                effectRows
             }
-            .frame(width: Self.contentWidth)
+            sectionDivider
+            sectionBlock(title: "화면 · 시스템") {
+                systemRows
+            }
+            if !model.axTrusted {
+                accessibilityBanner
+            }
+            sectionDivider
+            footerBar
         }
+        .padding(12)
+        .frame(width: Self.contentWidth)
+        .glassSurface(cornerRadius: 24, useFallback: useFallbackGlass)
         .padding(Self.outerPadding)
     }
 
-    private var heroCard: some View {
-        VStack(spacing: 10) {
+    private var sectionDivider: some View {
+        Rectangle()
+            .fill(dividerColor)
+            .frame(height: 0.75)
+    }
+
+    private var heroHeader: some View {
+        VStack(spacing: 9) {
             HStack(spacing: 10) {
                 heroBadge
                 VStack(alignment: .leading, spacing: 2) {
@@ -529,14 +475,8 @@ struct MenuPopoverView: View {
                 )
             }
 
-            Rectangle()
-                .fill(dividerColor)
-                .frame(height: 0.75)
-
             intensityBar
         }
-        .padding(12)
-        .glassSurface(cornerRadius: 22, useFallback: useFallbackGlass)
     }
 
     private var heroBadge: some View {
@@ -552,11 +492,7 @@ struct MenuPopoverView: View {
             Circle()
                 .fill(LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing))
                 .frame(width: 36, height: 36)
-                .overlay(
-                    Circle()
-                        .strokeBorder(Color.white.opacity(0.30), lineWidth: 0.75)
-                )
-                .shadow(color: (model.campfireOn ? Color.emberOrange : (model.snowOn ? Color.winterBlue : .clear)).opacity(0.30),
+                .shadow(color: (model.campfireOn ? Color.emberOrange : (model.snowOn ? Color.winterBlue : .clear)).opacity(0.28),
                         radius: 5, y: 2)
             Image(systemName: symbol)
                 .font(.system(size: 16, weight: .semibold))
@@ -594,13 +530,13 @@ struct MenuPopoverView: View {
         .padding(3)
         .background(
             Capsule(style: .continuous)
-                .fill(Color.primary.opacity(isDark ? 0.14 : 0.075))
+                .fill(Color.primary.opacity(isDark ? 0.14 : 0.065))
         )
     }
 
     private var quickActionsRow: some View {
         let plowSymbol = safeSymbol("wind.snow", "bus.fill", "car.fill")
-        return HStack(spacing: 8) {
+        return HStack(spacing: 6) {
             QuickTile(
                 id: "campfire",
                 title: "모닥불",
@@ -608,7 +544,6 @@ struct MenuPopoverView: View {
                 tint: .emberOrange,
                 activeTint: .emberOrange,
                 isActive: model.campfireOn,
-                useFallbackGlass: useFallbackGlass,
                 hoveredID: $model.hoveredID
             ) {
                 model.setCampfireOn(!model.campfireOn)
@@ -620,7 +555,6 @@ struct MenuPopoverView: View {
                 tint: .plowAmber,
                 activeTint: .plowAmber,
                 isActive: model.activeTileID == "plow",
-                useFallbackGlass: useFallbackGlass,
                 hoveredID: $model.hoveredID
             ) {
                 model.triggerPlow()
@@ -633,7 +567,6 @@ struct MenuPopoverView: View {
                 tint: .winterBlue,
                 activeTint: .winterBlue,
                 isActive: model.activeTileID == "spawn",
-                useFallbackGlass: useFallbackGlass,
                 hoveredID: $model.hoveredID
             ) {
                 model.triggerSpawnSnowman()
@@ -645,7 +578,6 @@ struct MenuPopoverView: View {
                 tint: .clearRose,
                 activeTint: .clearRose,
                 isActive: model.activeTileID == "clear",
-                useFallbackGlass: useFallbackGlass,
                 hoveredID: $model.hoveredID
             ) {
                 model.triggerClearSnow()
@@ -653,25 +585,15 @@ struct MenuPopoverView: View {
         }
     }
 
-    private func glassSection<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+    private func sectionBlock<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
             Text(title)
                 .font(.system(size: 10.5, weight: .semibold))
                 .foregroundColor(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.top, 9)
-                .padding(.bottom, 4)
+                .padding(.horizontal, 4)
+                .padding(.bottom, 2)
             content()
         }
-        .padding(.bottom, 3)
-        .glassSurface(cornerRadius: 22, useFallback: useFallbackGlass)
-    }
-
-    private var rowDivider: some View {
-        Rectangle()
-            .fill(dividerColor)
-            .frame(height: 0.75)
-            .padding(.leading, 42)
     }
 
     @ViewBuilder
@@ -685,7 +607,6 @@ struct MenuPopoverView: View {
             ) { model.setWindStrength($0) }
             SwitchControl(isOn: Binding(get: { model.windOn }, set: { model.setWindOn($0) }), tint: .winterBlue)
         }
-        rowDivider
         SettingRow(icon: "arrow.left.and.right", iconColor: .shakeIndigo, title: "창 흔들어 털기") {
             MiniChoicePill(
                 options: [(0, "약"), (1, "중"), (2, "강")],
@@ -695,7 +616,6 @@ struct MenuPopoverView: View {
             ) { model.setShakeStrength(ShakeStrength(rawValue: $0) ?? .normal) }
             SwitchControl(isOn: Binding(get: { model.shakeOn }, set: { model.setShakeOn($0) }), tint: .shakeIndigo)
         }
-        rowDivider
         SettingRow(icon: "drop.fill", iconColor: .meltCyan, title: "녹기 · 고드름") {
             MiniChoicePill(
                 options: [(0, "느림"), (1, "보통"), (2, "빠름")],
@@ -705,11 +625,9 @@ struct MenuPopoverView: View {
             ) { model.setMeltSpeed($0) }
             SwitchControl(isOn: Binding(get: { model.meltOn }, set: { model.setMeltOn($0) }), tint: .meltCyan)
         }
-        rowDivider
         SettingRow(icon: "snowman", useSnowmanGlyph: true, iconColor: .snowmanTeal, title: "눈사람 만들기", subtitle: "제목줄 클릭 · 굴리기") {
             SwitchControl(isOn: Binding(get: { model.snowmenOn }, set: { model.setSnowmenOn($0) }), tint: .snowmanTeal)
         }
-        rowDivider
         SettingRow(icon: safeSymbol("bus.fill", "car.fill"), iconColor: .plowAmber, title: "제설차 자동") {
             SwitchControl(isOn: Binding(get: { model.autoPlow }, set: { model.setAutoPlow($0) }), tint: .plowAmber)
         }
@@ -720,11 +638,9 @@ struct MenuPopoverView: View {
         SettingRow(icon: "square.stack.3d.up.fill", iconColor: .layerPurple, title: "눈송이 창 위로") {
             SwitchControl(isOn: Binding(get: { model.flakesOnTop }, set: { model.setFlakesOnTop($0) }), tint: .layerPurple)
         }
-        rowDivider
         SettingRow(icon: safeSymbol("rectangle.inset.filled", "macwindow"), iconColor: .screenSlate, title: "전체화면에서 숨기기") {
             SwitchControl(isOn: Binding(get: { model.hideInFullscreen }, set: { model.setHideInFullscreen($0) }), tint: .winterBlue)
         }
-        rowDivider
         SettingRow(icon: "leaf.fill", iconColor: .leafGreen, title: "배터리 절약") {
             MiniChoicePill(
                 options: [(0, "자동"), (1, "항상"), (2, "끄기")],
@@ -733,11 +649,9 @@ struct MenuPopoverView: View {
                 tint: .leafGreen
             ) { model.setBatteryMode(BatteryMode(rawValue: $0) ?? .auto) }
         }
-        rowDivider
         SettingRow(icon: "power", iconColor: .winterBlue, title: "로그인 시 자동 실행") {
             SwitchControl(isOn: Binding(get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }), tint: .winterBlue)
         }
-        rowDivider
         SettingRow(icon: safeSymbol("arrow.triangle.2.circlepath", "arrow.clockwise"), iconColor: .snowmanTeal, title: "자동 업데이트") {
             if model.updaterConfigured {
                 SwitchControl(isOn: Binding(get: { model.autoUpdateOn }, set: { model.setAutoUpdateOn($0) }), tint: .snowmanTeal)
@@ -785,9 +699,12 @@ struct MenuPopoverView: View {
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 11)
+        .padding(.horizontal, 10)
         .padding(.vertical, 8)
-        .glassSurface(cornerRadius: 18, tint: Color.plowAmber.opacity(0.45), interactive: false, useFallback: useFallbackGlass)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.plowAmber.opacity(isDark ? 0.20 : 0.13))
+        )
     }
 
     private var footerBar: some View {
@@ -798,7 +715,6 @@ struct MenuPopoverView: View {
                 symbol: "arrow.clockwise",
                 destructive: false,
                 enabled: model.canCheckForUpdates,
-                useFallbackGlass: useFallbackGlass,
                 hoveredID: $model.hoveredID
             ) {
                 model.checkForUpdates()
@@ -810,7 +726,6 @@ struct MenuPopoverView: View {
                 symbol: "power",
                 destructive: true,
                 enabled: true,
-                useFallbackGlass: useFallbackGlass,
                 hoveredID: $model.hoveredID
             ) {
                 model.quit()
@@ -865,21 +780,22 @@ private struct QuickTile: View {
     let tint: Color
     let activeTint: Color
     let isActive: Bool
-    let useFallbackGlass: Bool
     @Binding var hoveredID: String?
     let action: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
+    private var isDark: Bool { colorScheme == .dark }
     private var hovered: Bool { hoveredID == id }
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 4.5) {
+            VStack(spacing: 4) {
                 if useSnowmanGlyph {
                     SnowmanGlyph(color: isActive ? .white : tint)
-                        .frame(width: 15.5, height: 15.5)
+                        .frame(width: 15, height: 15)
                 } else {
                     Image(systemName: symbol)
-                        .font(.system(size: 15, weight: .semibold))
+                        .font(.system(size: 14.5, weight: .semibold))
                         .foregroundColor(isActive ? .white : tint)
                 }
                 Text(title)
@@ -888,9 +804,17 @@ private struct QuickTile: View {
                     .lineLimit(1)
             }
             .frame(maxWidth: .infinity)
-            .frame(height: 54)
-            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .glassSurface(cornerRadius: 18, tint: isActive ? activeTint.opacity(0.90) : (hovered ? tint.opacity(0.18) : nil), interactive: true, useFallback: useFallbackGlass)
+            .frame(height: 50)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(
+                        isActive ? activeTint.opacity(0.92)
+                            : (hovered ? tint.opacity(isDark ? 0.24 : 0.14)
+                                : Color.primary.opacity(isDark ? 0.10 : 0.05))
+                    )
+            )
+            .shadow(color: isActive ? activeTint.opacity(0.26) : .clear, radius: 5, y: 2)
+            .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
         .buttonStyle(PressScaleStyle())
         .onHover { inside in hoveredID = inside ? id : (hoveredID == id ? nil : hoveredID) }
@@ -941,8 +865,8 @@ private struct SettingRow<Control: View>: View {
                 control()
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5.5)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 4.5)
     }
 }
 
@@ -969,10 +893,6 @@ private struct PillSwitch: View {
                 Capsule(style: .continuous)
                     .fill(isOn ? tint : Color.primary.opacity(isDark ? 0.22 : 0.16))
                     .frame(width: width, height: height)
-                    .overlay(
-                        Capsule(style: .continuous)
-                            .strokeBorder(Color.white.opacity(isOn ? 0.22 : 0.10), lineWidth: 0.5)
-                    )
                 Circle()
                     .fill(Color.white)
                     .frame(width: knob, height: knob)
@@ -1042,10 +962,11 @@ private struct FooterButton: View {
     let symbol: String
     let destructive: Bool
     let enabled: Bool
-    let useFallbackGlass: Bool
     @Binding var hoveredID: String?
     let action: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
+    private var isDark: Bool { colorScheme == .dark }
     private var hovered: Bool { hoveredID == id }
 
     var body: some View {
@@ -1062,12 +983,15 @@ private struct FooterButton: View {
             )
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .contentShape(Capsule(style: .continuous))
-            .glassCapsule(
-                tint: destructive && hovered && enabled ? Color.clearRose.opacity(0.65) : nil,
-                interactive: enabled,
-                useFallback: useFallbackGlass
+            .background(
+                Capsule(style: .continuous)
+                    .fill(
+                        destructive && hovered && enabled ? Color.clearRose.opacity(0.88)
+                            : (hovered && enabled ? Color.primary.opacity(isDark ? 0.16 : 0.10)
+                                : Color.primary.opacity(isDark ? 0.09 : 0.05))
+                    )
             )
+            .contentShape(Capsule(style: .continuous))
         }
         .buttonStyle(PressScaleStyle())
         .disabled(!enabled)
