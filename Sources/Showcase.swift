@@ -364,6 +364,15 @@ enum Showcase {
                          "campfire should lower mean snow height: \(beforeMean) -> \(afterMean)")
             precondition(maxDrops >= 5, "campfire should spawn flowing water droplets (got \(maxDrops))")
             print("campfire: local \(String(format: "%.1f", beforeLocal)) -> \(String(format: "%.1f", afterLocal)), mean \(String(format: "%.2f", beforeMean)) -> \(String(format: "%.2f", afterMean)), maxDrops=\(maxDrops)")
+            let center = CGPoint(x: surf.minX + surf.width / 2, y: surf.top + 90 * S)
+            step(12) { i in
+                engine.campfirePoint = CGPoint(x: center.x + (i.isMultiple(of: 2) ? -32 : 32) * S, y: center.y)
+            }
+            let dimmed = engine.campfireFlame
+            precondition(dimmed < 0.2, "a fast shake should dim the campfire")
+            step(30) { _ in engine.campfirePoint = center }
+            precondition(engine.campfireFlame > 0.95, "the campfire should relight once the cursor stops")
+            print("campfire shake: flame \(dimmed) -> \(engine.campfireFlame)")
             cfSettings["campfireOn"] = false
             UserDefaults.standard.setVolatileDomain(cfSettings, forName: UserDefaults.argumentDomain)
             engine.applySettings()

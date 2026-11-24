@@ -12,7 +12,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Framewor
 for ARCH in arm64 x86_64; do
   swiftc -O -swift-version 5 -target "$ARCH-apple-macos$MIN" \
     -F "$SPARKLE_DIR" \
-    -framework AppKit -framework QuartzCore -framework ApplicationServices -framework IOKit -framework ServiceManagement -framework Sparkle \
+    -framework AppKit -framework SwiftUI -framework Combine -framework QuartzCore -framework ApplicationServices -framework IOKit -framework ServiceManagement -framework Sparkle \
     -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
     Sources/*.swift -o "build/obj/MacSnow-$ARCH"
 done

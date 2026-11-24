@@ -1,10 +1,12 @@
 // MacSnow — menu bar snow that lands and piles up on window tops and the Dock.
 import AppKit
+import SwiftUI
 import QuartzCore
 import ApplicationServices
 import IOKit.ps
 import ServiceManagement
 import Sparkle
+import Darwin
 
 /// Size scale so things read like the reel on large displays (1.0 on a ~900pt-tall screen).
 var S: CGFloat = {
@@ -87,18 +89,22 @@ protocol WindowProvider {
     var exposeActive: Bool { get }
     /// Frames of regular app windows covering an entire screen (e.g. fullscreen video / apps).
     var fullscreenFrames: [CGRect] { get }
+    /// Frames of external popup / context menu windows.
+    var popupFrames: [CGRect] { get }
 }
 extension WindowProvider {
     /// The window still exists (maybe on another Space, minimized or hidden), i.e. it wasn't closed.
     func exists(_ id: CGWindowID) -> Bool { frame(of: id) != nil }
     var exposeActive: Bool { false }
     var fullscreenFrames: [CGRect] { [] }
+    var popupFrames: [CGRect] { [] }
 }
 
 struct SystemWindows: WindowProvider {
     func fetch() -> [Win] { WindowList.fetch() }
     var exposeActive: Bool { WindowList.exposeActive }
     var fullscreenFrames: [CGRect] { WindowList.fullscreenFrames }
+    var popupFrames: [CGRect] { WindowList.popupFrames }
     /// Minimized windows and windows on other Spaces only show up in the full list (not in a
     /// single-window query), so look there. Called rarely (missing windows, ≤ every 2 s each).
     func exists(_ id: CGWindowID) -> Bool {
@@ -125,6 +131,7 @@ final class SimOverride: WindowProvider {
     func exists(_ id: CGWindowID) -> Bool { frames[id] != nil || SystemWindows().exists(id) }
     var exposeActive: Bool { WindowList.exposeActive }
     var fullscreenFrames: [CGRect] { WindowList.fullscreenFrames }
+    var popupFrames: [CGRect] { WindowList.popupFrames }
 }
 
 enum WindowList {
@@ -132,6 +139,7 @@ enum WindowList {
     /// on older systems) over the desktop. Owner names and layers need no screen-recording permission.
     static var exposeActive = false
     static var fullscreenFrames: [CGRect] = []
+    static var popupFrames: [CGRect] = []
     static let exposeLayers = 18...19
     private static let systemOwners: Set<String> = [
         "Window Server", "WindowManager", "Dock", "loginwindow", "ControlCenter",
@@ -142,13 +150,16 @@ enum WindowList {
         let screens = NSScreen.screens
         let primaryH = screens.first?.frame.height ?? 0
         let me = ProcessInfo.processInfo.processIdentifier
+        let popupLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
         var out: [Win] = []
         var fsFrames: [CGRect] = []
+        var popups: [CGRect] = []
         let screenArea = screens.map { $0.frame.width * $0.frame.height }.max() ?? 1
         var expose = false
         defer {
             exposeActive = expose
             fullscreenFrames = fsFrames
+            popupFrames = popups
         }
         var menuBarScreens = Set<Int>()
         for info in raw {
@@ -167,7 +178,7 @@ enum WindowList {
         for info in raw {
             let layer = info[kCGWindowLayer as String] as? Int ?? -1
             let owner = info[kCGWindowOwnerName as String] as? String
-            if owner == "WindowManager" || owner == "Dock" {
+            if owner == "WindowManager" || (owner == "Dock" && layer != popupLayer) {
                 if exposeLayers.contains(layer) { expose = true }
                 continue                      // Mission Control / Stage Manager chrome, never a surface
             }
@@ -178,8 +189,12 @@ enum WindowList {
             let alpha = info[kCGWindowAlpha as String] as? CGFloat ?? 1
             if alpha < 0.1 { continue }
             let w = b["Width"] ?? 0, h = b["Height"] ?? 0
-            guard w >= 80, h >= 50 else { continue }
             let x = b["X"] ?? 0, y = b["Y"] ?? 0
+            if layer == popupLayer, w >= 30, h >= 20, w * h < screenArea * 0.6 {
+                popups.append(CGRect(x: x, y: primaryH - y - h, width: w, height: h))
+                continue
+            }
+            guard w >= 80, h >= 50 else { continue }
             let rect = CGRect(x: x, y: primaryH - y - h, width: w, height: h)
             if alpha >= 0.9, let pid = info[kCGWindowOwnerPID as String] as? Int32,
                !(owner.map { systemOwners.contains($0) } ?? false) {
@@ -667,6 +682,41 @@ func makePlowLayer(px: CGFloat) -> (CALayer, CGFloat) {
     return (root, 15 * px)
 }
 
+enum CampfireCursor {
+    private typealias CGSConnFn = @convention(c) () -> Int32
+    private typealias CGSSetPropFn = @convention(c) (Int32, Int32, CFString, CFTypeRef) -> CGError
+
+    private static let cgsMainConn: CGSConnFn? = {
+        guard let h = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
+              let p = dlsym(h, "CGSMainConnectionID") ?? dlsym(h, "_CGSDefaultConnection") else { return nil }
+        return unsafeBitCast(p, to: CGSConnFn.self)
+    }()
+    private static let cgsSetProp: CGSSetPropFn? = {
+        guard let h = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
+              let p = dlsym(h, "CGSSetConnectionProperty") else { return nil }
+        return unsafeBitCast(p, to: CGSSetPropFn.self)
+    }()
+
+    private(set) static var isHidden = false
+
+    static func setHidden(_ hide: Bool) {
+        guard hide != isHidden else { return }
+        if hide {
+            if let cid = cgsMainConn?(), cid != 0 {
+                _ = cgsSetProp?(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+            }
+            CGDisplayHideCursor(CGMainDisplayID())
+            isHidden = true
+        } else {
+            CGDisplayShowCursor(CGMainDisplayID())
+            if let cid = cgsMainConn?(), cid != 0 {
+                _ = cgsSetProp?(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanFalse)
+            }
+            isHidden = false
+        }
+    }
+}
+
 enum CampfireAssets {
     /// Soft warm radial amber/orange glow halo behind the campfire.
     static let glowImage: CGImage? = {
@@ -862,7 +912,7 @@ final class CampfireVisual {
         root.addSublayer(outerFlame)
         root.addSublayer(midFlame)
         root.addSublayer(innerFlame)
-        update(phase: 0, velocity: .zero)
+        update(phase: 0, velocity: .zero, flame: 1)
     }
 
     private func flamePath(baseX: CGFloat = 0, baseY: CGFloat, halfW: CGFloat, height: CGFloat, tipX: CGFloat, bellyShift: CGFloat) -> CGPath {
@@ -894,8 +944,9 @@ final class CampfireVisual {
         return p
     }
 
-    func update(phase: CGFloat, velocity: CGPoint) {
+    func update(phase: CGFloat, velocity: CGPoint, flame: CGFloat) {
         let s = S
+        let heightScale = 0.24 + 0.76 * flame
         let leanX = max(-14 * s, min(14 * s, -velocity.x * 0.018))
         let stretchY = max(-3.5 * s, min(5.5 * s, -velocity.y * 0.005))
 
@@ -907,23 +958,27 @@ final class CampfireVisual {
         let pulse3 = 1 + 0.13 * cos(phase * 16.1 + 1.7)
 
         let outer = CGMutablePath()
-        outer.addPath(flamePath(baseY: -4.8 * s, halfW: 9.2 * s, height: (24.5 * s + stretchY) * pulse1,
+        outer.addPath(flamePath(baseY: -4.8 * s, halfW: 9.2 * s, height: (24.5 * s + stretchY) * pulse1 * heightScale,
                                 tipX: leanX + sway1, bellyShift: leanX * 0.25 + sway1 * 0.3))
-        let leftLickH = (11.5 + 2.2 * sin(phase * 12.1 + 0.4)) * s
+        let leftLickH = (11.5 + 2.2 * sin(phase * 12.1 + 0.4)) * s * heightScale
         outer.addPath(flamePath(baseX: -4.5 * s, baseY: -4.6 * s, halfW: 3.3 * s, height: leftLickH,
                                 tipX: -2.0 * s + leanX * 0.65 + sway2 * 0.7, bellyShift: -0.8 * s + leanX * 0.15))
-        let rightLickH = (10.5 + 2.0 * cos(phase * 13.3 + 1.5)) * s
+        let rightLickH = (10.5 + 2.0 * cos(phase * 13.3 + 1.5)) * s * heightScale
         outer.addPath(flamePath(baseX: 4.5 * s, baseY: -4.6 * s, halfW: 3.1 * s, height: rightLickH,
                                 tipX: 1.8 * s + leanX * 0.65 - sway2 * 0.6, bellyShift: 0.8 * s + leanX * 0.15))
         outerFlame.path = outer
 
-        midFlame.path = flamePath(baseY: -4.4 * s, halfW: 6.4 * s, height: (17.5 * s + stretchY * 0.65) * pulse2,
+        midFlame.path = flamePath(baseY: -4.4 * s, halfW: 6.4 * s, height: (17.5 * s + stretchY * 0.65) * pulse2 * heightScale,
                                   tipX: leanX * 0.72 + sway2, bellyShift: leanX * 0.18 + sway2 * 0.25)
-        innerFlame.path = flamePath(baseY: -4.0 * s, halfW: 3.5 * s, height: (10.5 * s + stretchY * 0.35) * pulse3,
+        innerFlame.path = flamePath(baseY: -4.0 * s, halfW: 3.5 * s, height: (10.5 * s + stretchY * 0.35) * pulse3 * heightScale,
                                     tipX: leanX * 0.42 + sway3, bellyShift: leanX * 0.10 + sway3 * 0.2)
 
         let glowPulse = 0.94 + 0.08 * sin(phase * 5.3) + 0.04 * cos(phase * 9.7)
-        glow.opacity = Float(0.80 + 0.18 * sin(phase * 4.7) * cos(phase * 2.3))
+        let flameOpacity = Float(0.22 + 0.78 * flame)
+        outerFlame.opacity = flameOpacity
+        midFlame.opacity = flameOpacity
+        innerFlame.opacity = flameOpacity
+        glow.opacity = Float((0.80 + 0.18 * sin(phase * 4.7) * cos(phase * 2.3)) * (0.15 + 0.85 * flame))
         glow.setAffineTransform(CGAffineTransform(scaleX: glowPulse, y: glowPulse))
         coalGlow.opacity = Float(0.70 + 0.28 * (0.5 + 0.5 * sin(phase * 6.4)))
     }
@@ -1258,6 +1313,8 @@ final class Engine {
     var campfireLastPoint: CGPoint?
     var campfireVel: CGPoint = .zero
     var campfirePhase: CGFloat = 0
+    var campfireFlame: CGFloat = 1
+    private var campfireGustUntil: CFTimeInterval = 0
     var campfireMelting = false
     var meltDrops: [MeltDrop] = []
     var meltDropPool: [CALayer] = []
@@ -1271,12 +1328,15 @@ final class Engine {
     var timer: Timer?
     var interval: Double = 0
     var paused = false
+    var onStateChange: (() -> Void)?
     var lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
     var onAC = true
     var powerSource: CFRunLoopSource?
     var lastMelt = CACurrentMediaTime()
     var mouseMoveMonitor: Any?
+    var localMouseMonitor: Any?
     var mouseMoveMask: NSEvent.EventTypeMask = []
+    var popupFrames: [CGRect] = []
     var windPoint: CGPoint?
     var windTime: CFTimeInterval = 0
     var lastGust: CFTimeInterval = -.infinity
@@ -1416,6 +1476,9 @@ final class Engine {
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             DockGeometry.invalidate()
             self?.rebuildOverlays()
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+            CampfireCursor.setHidden(false)
         }
         installMouseMonitors()
         installPowerObservers()
@@ -1576,7 +1639,10 @@ final class Engine {
             }
             pauseWatch?.tolerance = 1
         }
-        if p { dropAllFlakes() }
+        if p {
+            setCampfireCursorHidden(false)
+            dropAllFlakes()
+        }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         applyOverlayVisibility(animated: false)
         for o in overlays { o.root.speed = p ? 0 : 1 }   // freezes plow beacon etc. on the GPU side too
@@ -1603,6 +1669,7 @@ final class Engine {
     }
 
     func rebuildOverlays() {
+        setCampfireCursorHidden(false)
         for o in overlays { o.window?.orderOut(nil); o.backWindow?.orderOut(nil) }
         dropAllFlakes()
         campfireVisual?.remove()
@@ -1626,6 +1693,7 @@ final class Engine {
             if virtualNow == nil { campfirePoint = NSEvent.mouseLocation }
         } else {
             campfireVel = .zero; campfireLastPoint = nil; campfireMelting = false
+            setCampfireCursorHidden(false)
         }
         for o in overlays { o.updateCollectionBehavior(hideInFullscreen: Settings.shared.hideInFullscreen) }
         if !Settings.shared.hideInFullscreen { setFullscreenOverlays([]) }
@@ -1635,6 +1703,7 @@ final class Engine {
         refreshGeometry()
         CATransaction.commit()
         updateRate()
+        onStateChange?()
     }
 
     func clearSnow() { piles.removeAll(); dropAllFlakes(); pileDirty = true; geometryChanged = true; removeAllProps() }
@@ -1656,6 +1725,7 @@ final class Engine {
         setExpose(windowSource.exposeActive)
         // Mission Control: windows are shrunk thumbnails; keep the real geometry (and the snow) as it was
         if expose { return }
+        popupFrames = windowSource.popupFrames
         setFullscreenOverlays(detectFullscreenOverlays(wins: list))
         // while a title-bar drag is followed by prediction, the list's (older) frame mustn't pull it back
         if let d = drag, d.confirmed, let i = list.firstIndex(where: { $0.id == d.id }),
@@ -1776,8 +1846,9 @@ final class Engine {
     }
 
     func applyOverlayVisibility(animated: Bool = true) {
-        let fsPoint = campfirePoint.map { isFullscreen(at: $0) } ?? false
-        campfireVisual?.root.isHidden = !Settings.shared.campfireOn || paused || expose || fsPoint
+        let showCampfire = campfirePoint.flatMap { campfireOverlay(at: $0) } != nil
+        campfireVisual?.root.isHidden = !showCampfire
+        if !showCampfire { setCampfireCursorHidden(false) }
         for (i, o) in overlays.enumerated() {
             let fs = fullscreenOverlays.contains(i)
             let frontTo: Float = (expose || fs) ? 0 : 1
@@ -1916,6 +1987,8 @@ final class Engine {
             if tickCount % 8 == 0 { refreshGeometry() }
         } else if mouseIsDown || forceFast {
             if tickCount % 8 == 0 { refreshGeometry() } else { refreshDragged() }
+        } else if Settings.shared.campfireOn && now - lastGeometryPoll >= 0.25 {
+            refreshGeometry()
         } else if now - lastGeometryPoll >= (now - lastGeometryChange < 2 ? 0.25 : 0.5) { refreshGeometry() }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         if virtualNow == nil, !paused, now - lastMelt >= 2 {
@@ -1952,6 +2025,18 @@ final class Engine {
     }
 
     func updateMouseMoveMonitor() {
+        if Settings.shared.campfireOn && virtualNow == nil {
+            if localMouseMonitor == nil {
+                localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged]) { [weak self] ev in
+                    self?.updateCampfirePointer(at: NSEvent.mouseLocation)
+                    return ev
+                }
+            }
+        } else if let lm = localMouseMonitor {
+            NSEvent.removeMonitor(lm)
+            localMouseMonitor = nil
+        }
+
         var want: NSEvent.EventTypeMask = []
         if Settings.shared.windOn || Settings.shared.meltOn || Settings.shared.campfireOn { want.insert(.mouseMoved) }
         if Settings.shared.campfireOn { want.insert(.rightMouseDragged) }
@@ -3153,16 +3238,44 @@ final class Engine {
 
     // MARK: campfire
 
+    private func setCampfireCursorHidden(_ hidden: Bool) {
+        guard virtualNow == nil else { return }
+        CampfireCursor.setHidden(hidden)
+    }
+
+    private func isPointInOwnPopup(_ p: CGPoint) -> Bool {
+        let popupLevel = Int(CGWindowLevelForKey(.popUpMenuWindow))
+        return NSApp.windows.contains { w in
+            w.isVisible && !w.ignoresMouseEvents && w.alphaValue > 0.05 &&
+            w.level.rawValue >= popupLevel &&
+            w.frame.insetBy(dx: 6, dy: 6).contains(p)
+        }
+    }
+
+    private func campfireOverlay(at p: CGPoint) -> Overlay? {
+        guard Settings.shared.campfireOn, !paused, !expose, p.x.isFinite, p.y.isFinite,
+              !isFullscreen(at: p), let o = overlays.first(where: { $0.frame.contains(p) }) else { return nil }
+        if virtualNow == nil {
+            if o.clip.frame.height < o.frame.height - 1 && p.y >= o.frame.minY + o.clip.frame.height - 2 {
+                return nil
+            }
+            if isPointInOwnPopup(p) { return nil }
+            if popupFrames.contains(where: { $0.contains(p) }) { return nil }
+        }
+        return o
+    }
+
     func updateCampfirePointer(at p: CGPoint) {
         guard Settings.shared.campfireOn, p.x.isFinite, p.y.isFinite else { return }
         campfirePoint = p
-        guard !paused, !expose, !overlays.isEmpty, let vis = campfireVisual else { return }
-        if isFullscreen(at: p) {
-            vis.root.isHidden = true
+        guard let o = campfireOverlay(at: p) else {
+            campfireVisual?.root.isHidden = true
+            setCampfireCursorHidden(false)
             return
         }
         CATransaction.begin(); CATransaction.setDisableActions(true)
-        let o = overlays[overlayIndex(for: p)]
+        let vis = campfireVisual ?? CampfireVisual()
+        campfireVisual = vis
         if vis.parent !== o.actors {
             vis.root.removeFromSuperlayer()
             o.actors.addSublayer(vis.root)
@@ -3170,6 +3283,7 @@ final class Engine {
         }
         vis.root.isHidden = false
         vis.root.position = o.local(p)
+        setCampfireCursorHidden(true)
         CATransaction.commit()
     }
 
@@ -3182,15 +3296,19 @@ final class Engine {
         let active = Settings.shared.campfireOn && !paused && !expose && !overlays.isEmpty
         if !active {
             campfireVisual?.root.isHidden = true
+            setCampfireCursorHidden(false)
             campfireVel = .zero
             campfireLastPoint = nil
+            campfireFlame = 1
+            campfireGustUntil = 0
             return
         }
         if virtualNow == nil {
             campfirePoint = NSEvent.mouseLocation
         }
-        guard let p = campfirePoint, p.x.isFinite, p.y.isFinite, !isFullscreen(at: p) else {
+        guard let p = campfirePoint, let o = campfireOverlay(at: p) else {
             campfireVisual?.root.isHidden = true
+            setCampfireCursorHidden(false)
             campfireVel = .zero
             campfireLastPoint = nil
             return
@@ -3198,6 +3316,10 @@ final class Engine {
 
         if let prev = campfireLastPoint, dt > 0.001 {
             let raw = CGPoint(x: (p.x - prev.x) / dt, y: (p.y - prev.y) / dt)
+            if hypot(raw.x, raw.y) >= 1050 * S {
+                // Keep the flame low through the brief pause at each reversal.
+                campfireGustUntil = now + 0.14
+            }
             let alpha = min(1, dt * 14)
             campfireVel = CGPoint(x: campfireVel.x + (raw.x - campfireVel.x) * alpha,
                                   y: campfireVel.y + (raw.y - campfireVel.y) * alpha)
@@ -3205,10 +3327,13 @@ final class Engine {
             campfireVel = .zero
         }
         campfireLastPoint = p
+        let gust = now < campfireGustUntil
+        let target: CGFloat = gust ? 0 : 1
+        let response: CGFloat = gust ? 0.075 : 0.23
+        campfireFlame += (target - campfireFlame) * (1 - exp(-dt / response))
 
         let vis = campfireVisual ?? CampfireVisual()
         campfireVisual = vis
-        let o = overlays[overlayIndex(for: p)]
         if vis.parent !== o.actors {
             vis.root.removeFromSuperlayer()
             o.actors.addSublayer(vis.root)
@@ -3216,11 +3341,12 @@ final class Engine {
         }
         vis.root.isHidden = false
         vis.root.position = o.local(p)
+        setCampfireCursorHidden(true)
         campfirePhase += dt
-        vis.update(phase: campfirePhase, velocity: campfireVel)
+        vis.update(phase: campfirePhase, velocity: campfireVel, flame: campfireFlame)
 
         // Rising ember sparks (capped at 25)
-        sparkDebt += (lowPower ? 7 : 12) * dt
+        sparkDebt += (lowPower ? 7 : 12) * dt * campfireFlame
         while sparkDebt >= 1 {
             sparkDebt -= 1
             if campfireSparks.count >= 25 { sparkDebt = 0; break }
@@ -3229,7 +3355,7 @@ final class Engine {
 
         // Heat melting within radius ~68 * S
         let radius = 68 * S
-        let dropThreshold = 6.0 * S * S
+        let dropThreshold = 24.0 * S * S
 
         // 1) Snow piles & icicles
         for (key, surf) in surfaces {
@@ -3259,13 +3385,16 @@ final class Engine {
                     if surfMelted > 0 {
                         pile.dirty = true; pileDirty = true; campfireMelting = true
                         meltWaterDebt += surfMelted
-                        while meltWaterDebt >= dropThreshold {
+                        var spawned = 0
+                        while meltWaterDebt >= dropThreshold && spawned < 2 {
                             meltWaterDebt -= dropThreshold
+                            spawned += 1
                             let dropX = (spots.randomElement() ?? p.x) + .random(in: -2...2) * S
                             spawnMeltDrop(at: CGPoint(x: dropX, y: surf.top - 1 * S),
                                           source: key, fromDock: surf.z < 0,
                                           cling: .random(in: 0.14...0.30))
                         }
+                        if meltWaterDebt > dropThreshold { meltWaterDebt = dropThreshold }
                         if now - lastSteam >= 0.14, let sx = spots.randomElement() {
                             lastSteam = now
                             spawnCampfireSteam(at: CGPoint(x: sx, y: surf.top + 3 * S))
@@ -3292,9 +3421,9 @@ final class Engine {
                     let nextLen = site.length - shrink
                     pile.icicles[i].length = nextLen < 0.8 ? 0 : nextLen
                     pile.icicleDirty = true; pileDirty = true; campfireMelting = true
-                    meltWaterDebt += shrink * 2.2 * S
-                    while meltWaterDebt >= dropThreshold {
-                        meltWaterDebt -= dropThreshold
+                    meltWaterDebt += shrink * 1.3 * S
+                    if meltWaterDebt >= dropThreshold {
+                        meltWaterDebt = min(meltWaterDebt - dropThreshold, dropThreshold)
                         spawnMeltDrop(at: CGPoint(x: gx, y: surf.top - pile.icicles[i].length),
                                       source: key, fromDock: false,
                                       cling: .random(in: 0.04...0.10))
@@ -3323,8 +3452,8 @@ final class Engine {
                 if m.scale < minScale {
                     let basePos = m.pos
                     let halfW = m.halfWidth
-                    let splashCount = m.kind == .snowman ? 10 : 6
-                    let trickleCount = m.kind == .snowman ? 6 : 4
+                    let splashCount = m.kind == .snowman ? 5 : 3
+                    let trickleCount = m.kind == .snowman ? 3 : 2
                     m.remove()
                     spawnWaterSplash(at: CGPoint(x: basePos.x, y: basePos.y + 2 * S), count: splashCount)
                     for _ in 0..<trickleCount {
@@ -3342,9 +3471,9 @@ final class Engine {
                     d.setAffineTransform(CGAffineTransform(scaleX: dk, y: dk))
                 }
                 place(m)
-                meltWaterDebt += (m.kind == .snowman ? shrink * 28 * S : shrink * 3.2 * S)
-                while meltWaterDebt >= dropThreshold {
-                    meltWaterDebt -= dropThreshold
+                meltWaterDebt += (m.kind == .snowman ? shrink * 16 * S : shrink * 2.0 * S)
+                if meltWaterDebt >= dropThreshold {
+                    meltWaterDebt = min(meltWaterDebt - dropThreshold, dropThreshold)
                     spawnMeltDrop(at: CGPoint(x: m.pos.x + .random(in: -m.halfWidth...m.halfWidth) * 0.6, y: m.pos.y),
                                   source: source, fromDock: fromDock,
                                   cling: .random(in: 0.12...0.26))
@@ -3379,10 +3508,10 @@ final class Engine {
     }
 
     func spawnMeltDrop(at pos: CGPoint, source: UInt64, fromDock: Bool, cling: CGFloat) {
-        guard !overlays.isEmpty, meltDrops.count < 140 else { return }
+        guard !overlays.isEmpty, meltDrops.count < 45 else { return }
         let layer = meltDropLayer(splash: false)
-        let w = CGFloat.random(in: 3.4...5.2) * S
-        let h = w * 1.45
+        let w = CGFloat.random(in: 2.0...3.1) * S
+        let h = w * 1.35
         layer.bounds = CGRect(x: 0, y: 0, width: w, height: h)
         let o = overlays[overlayIndex(for: pos)]
         o.actors.addSublayer(layer)
@@ -3400,18 +3529,18 @@ final class Engine {
     func spawnWaterSplash(at pos: CGPoint, count: Int) {
         guard !overlays.isEmpty else { return }
         for _ in 0..<count {
-            guard meltDrops.count < 140 else { break }
+            guard meltDrops.count < 55 else { break }
             let layer = meltDropLayer(splash: true)
-            let d = CGFloat.random(in: 2.4...4.0) * S
+            let d = CGFloat.random(in: 1.4...2.3) * S
             layer.bounds = CGRect(x: 0, y: 0, width: d, height: d)
             let o = overlays[overlayIndex(for: pos)]
             o.actors.addSublayer(layer)
             layer.position = o.local(pos)
-            let ttl = CGFloat.random(in: 0.22...0.42)
+            let ttl = CGFloat.random(in: 0.18...0.32)
             meltDrops.append(MeltDrop(
                 layer: layer, pos: pos,
-                vx: .random(in: -88...88) * S,
-                vy: .random(in: 55...135) * S,
+                vx: .random(in: -62...62) * S,
+                vy: .random(in: 40...95) * S,
                 width: d, cling: 0,
                 source: 0, fromDock: true,
                 isSplash: true, ttl: ttl, maxTTL: ttl
@@ -3449,7 +3578,7 @@ final class Engine {
                 }
                 d.pos.x += d.vx * dt
                 d.pos.y += d.vy * dt
-                let stretch = min(4.2, 1.35 + abs(d.vy) / (115 * S))
+                let stretch = min(2.2, 1.28 + abs(d.vy) / (250 * S))
                 d.layer.bounds = CGRect(x: 0, y: 0, width: d.width, height: d.width * stretch)
 
                 if !d.fromDock, d.pos.y < oldY,
@@ -3471,7 +3600,7 @@ final class Engine {
         }
         meltDrops = kept
         for pt in splashes {
-            spawnWaterSplash(at: pt, count: Int.random(in: 3...4))
+            spawnWaterSplash(at: pt, count: Int.random(in: 1...2))
         }
     }
 
@@ -3971,11 +4100,16 @@ final class Updater {
 
 // MARK: - App / menu bar
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     let engine = Engine()
     var item: NSStatusItem!
-    let menu = NSMenu()
+    var panel: FloatingMenuPanel!
+    var hostingController: NSHostingController<MenuPopoverView>!
+    var menuModel: MenuModel!
     var updater: Updater?
+    var popoverMonitor: Any?
+    var refreshTimer: Timer?
+    var openGeneration = 0
 
     var termSource: DispatchSourceSignal?
     func applicationWillTerminate(_ n: Notification) { engine.saveState() }
@@ -3987,14 +4121,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         termSource?.setEventHandler { [weak self] in self?.engine.saveState(); exit(0) }
         termSource?.resume()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        updateStatusIcon()
         if let b = item.button {
-            if let img = NSImage(systemSymbolName: "snowflake", accessibilityDescription: "MacSnow") {
-                img.isTemplate = true; b.image = img
-            } else { b.title = "❄" }
+            b.target = self
+            b.action = #selector(togglePopover(_:))
         }
-        menu.delegate = self
-        item.menu = menu
         updater = Updater()
+        menuModel = MenuModel(
+            engine: engine,
+            updater: updater,
+            actions: MenuModel.Actions(
+                requestDockAccess: { [weak self] in self?.requestDockAccess() },
+                toggleLogin: { [weak self] in self?.toggleLogin() },
+                checkForUpdates: { [weak self] in self?.checkForUpdates() },
+                closePopover: { [weak self] in self?.closePopover() },
+                updateStatusIcon: { [weak self] in self?.updateStatusIcon() },
+                quit: { [weak self] in self?.quit() }
+            )
+        )
+        hostingController = NSHostingController(rootView: MenuPopoverView(model: menuModel))
+
+        panel = FloatingMenuPanel(
+            contentRect: NSRect(x: 0, y: 0, width: MenuPopoverView.contentWidth, height: 500),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .transient, .fullScreenAuxiliary, .ignoresCycle]
+        panel.isReleasedWhenClosed = false
+        panel.isMovable = false
+        panel.contentViewController = hostingController
+        panel.onEscape = { [weak self] in self?.closePopover() }
+
+        engine.onStateChange = { [weak self] in
+            self?.updateStatusIcon()
+            self?.menuModel?.refresh()
+        }
         engine.start()
         askDockAccessOncePerBuild()
         if ProcessInfo.processInfo.arguments.contains("--demo") {
@@ -4003,75 +4169,95 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        let s = Settings.shared
-        menu.removeAllItems()
-        func add(_ title: String, _ sel: Selector, on: Bool? = nil, key: String = "", enabled: Bool = true) {
-            let i = NSMenuItem(title: title, action: enabled ? sel : nil, keyEquivalent: key)
-            i.target = enabled ? self : nil
-            if let on { i.state = on ? .on : .off }
-            menu.addItem(i)
+    func updateStatusIcon() {
+        guard let b = item?.button else { return }
+        let campfire = Settings.shared.campfireOn
+        let sym = campfire ? "flame.fill" : "snowflake"
+        if let img = NSImage(systemSymbolName: sym, accessibilityDescription: "MacSnow") {
+            img.isTemplate = true
+            b.image = img
+        } else {
+            b.title = campfire ? "🔥" : "❄"
         }
-        add("눈 내리기 (Snow)", #selector(toggleSnow), on: s.snowOn)
-        let sub = NSMenu()
-        for it in Intensity.allCases {
-            let i = NSMenuItem(title: it.title, action: #selector(setIntensity(_:)), keyEquivalent: "")
-            i.target = self; i.tag = it.rawValue; i.state = it == s.intensity ? .on : .off
-            sub.addItem(i)
-        }
-        let parent = NSMenuItem(title: "세기 (Intensity)", action: nil, keyEquivalent: "")
-        parent.submenu = sub
-        menu.addItem(parent)
-        func choices(_ title: String, _ titles: [String], _ selected: Int, _ action: Selector) {
-            let submenu = NSMenu()
-            for (tag, title) in titles.enumerated() {
-                let i = NSMenuItem(title: title, action: action, keyEquivalent: "")
-                i.target = self; i.tag = tag; i.state = tag == selected ? .on : .off
-                submenu.addItem(i)
-            }
-            let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-            i.submenu = submenu; menu.addItem(i)
-        }
-        add("마우스 바람 (Mouse wind)", #selector(toggleWind), on: s.windOn)
-        choices("바람 세기 (Wind strength)", ["약하게 (Gentle)", "보통 (Normal)", "세게 (Strong)"], s.windStrength, #selector(setWindStrength(_:)))
-        add("창 흔들어 눈 털기 (Shake off snow)", #selector(toggleShake), on: s.shakeOn)
-        choices("눈 털기 강도 (Shake strength)", ShakeStrength.allCases.map { $0.title }, s.shakeStrength.rawValue, #selector(setShakeStrength(_:)))
-        add("녹기·고드름 (Melting & icicles)", #selector(toggleMelt), on: s.meltOn)
-        choices("녹는 속도 (Melt speed)", ["느리게 (Slow)", "보통 (Normal)", "빠르게 (Fast)"], s.meltSpeed, #selector(setMeltSpeed(_:)))
-        add("모닥불 모드 (Campfire mode)", #selector(toggleCampfire), on: s.campfireOn)
-        choices("배터리 절약 (Battery saving)", BatteryMode.allCases.map { $0.title }, s.batteryMode.rawValue, #selector(setBatteryMode(_:)))
-        add("로그인 시 자동 실행 (Launch at login)", #selector(toggleLogin), on: SMAppService.mainApp.status == .enabled)
-        add("눈사람 (Snowmen) — 제목줄 클릭 / 눈 굴리기", #selector(toggleSnowmen), on: s.snowmenOn)
-        add("제설차 자동 (Auto plow)", #selector(toggleAutoPlow), on: s.autoPlow)
-        add("눈송이 창 위로 (Flakes over windows)", #selector(toggleFlakesOnTop), on: s.flakesOnTop)
-        add("전체화면에서 숨기기 (Hide in full screen)", #selector(toggleHideInFullscreen), on: s.hideInFullscreen)
-        if !AXIsProcessTrusted() {
-            add("Dock 크기 정확히 맞추기 (손쉬운 사용 권한)", #selector(requestDockAccess))
-        }
-        menu.addItem(.separator())
-        add("지금 Dock 제설 (Plow the Dock now)", #selector(plowNow))
-        add("앞 창에 눈사람 놓기 (Debug)", #selector(debugSpawn))
-        add("눈 치우기 (Clear snow)", #selector(clearSnow))
-        menu.addItem(.separator())
-        add("업데이트 확인… (Check for Updates…)", #selector(checkForUpdates), enabled: updater?.canCheckForUpdates ?? false)
-        add("자동 업데이트 확인 (Check for updates automatically)", #selector(toggleAutoUpdates), on: updater?.automaticallyChecksForUpdates ?? false, enabled: updater?.isConfigured ?? false)
-        menu.addItem(.separator())
-        add("종료 (Quit)", #selector(quit), key: "q")
     }
 
-    @objc func toggleWind() { Settings.shared.windOn.toggle(); engine.updateMouseMoveMonitor() }
-    @objc func setWindStrength(_ i: NSMenuItem) { Settings.shared.windStrength = i.tag }
-    @objc func toggleShake() { Settings.shared.shakeOn.toggle() }
-    @objc func setShakeStrength(_ i: NSMenuItem) { Settings.shared.shakeStrength = ShakeStrength(rawValue: i.tag) ?? .normal }
-    @objc func toggleMelt() { Settings.shared.meltOn.toggle(); engine.applySettings() }
-    @objc func setMeltSpeed(_ i: NSMenuItem) { Settings.shared.meltSpeed = i.tag; engine.lastMelt = engine.clock() }
-    @objc func toggleCampfire() { Settings.shared.campfireOn.toggle(); engine.applySettings() }
-    @objc func setBatteryMode(_ i: NSMenuItem) { Settings.shared.batteryMode = BatteryMode(rawValue: i.tag) ?? .auto; engine.updatePower() }
+    @MainActor @objc func togglePopover(_ sender: Any?) {
+        if panel.isVisible {
+            closePopover()
+            return
+        }
+        guard let b = item.button else { return }
+        openGeneration += 1
+        menuModel.refresh()
+        hostingController.rootView = MenuPopoverView(model: menuModel)
+        hostingController.view.layoutSubtreeIfNeeded()
+        let width = MenuPopoverView.contentWidth
+        let naturalHeight = ceil(hostingController.view.fittingSize.height)
+        let buttonRect: NSRect = if let btnWin = b.window {
+            btnWin.convertToScreen(b.convert(b.bounds, to: nil))
+        } else {
+            NSRect(origin: NSEvent.mouseLocation, size: .zero)
+        }
+        let screen = NSScreen.screens.first { $0.frame.contains(CGPoint(x: buttonRect.midX, y: buttonRect.midY)) }
+            ?? NSScreen.main ?? NSScreen.screens.first
+        if let screen {
+            let vf = screen.visibleFrame
+            let top = min(vf.maxY, buttonRect.minY - 6)
+            let height = min(naturalHeight, max(1, floor(top - vf.minY - 8)))
+            if height < naturalHeight {
+                hostingController.rootView = MenuPopoverView(model: menuModel, scrollHeight: height)
+            }
+            let x = max(vf.minX + 8, min(buttonRect.midX - width / 2, vf.maxX - width - 8))
+            panel.setFrame(NSRect(x: round(x), y: round(top - height), width: width, height: height), display: true)
+        }
+        panel.alphaValue = 0
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.14
+            panel.animator().alphaValue = 1
+        }
+        popoverMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.closePopover()
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidResignActive),
+                                               name: NSApplication.didResignActiveNotification, object: nil)
+        refreshTimer?.invalidate()
+        let model = menuModel
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            Task { @MainActor in model?.refreshLiveStats() }
+        }
+    }
+
+    @MainActor @objc func appDidResignActive() { closePopover() }
+
+    func closePopover() {
+        if let monitor = popoverMonitor {
+            NSEvent.removeMonitor(monitor)
+            popoverMonitor = nil
+        }
+        NotificationCenter.default.removeObserver(self, name: NSApplication.didResignActiveNotification, object: nil)
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+        guard panel.isVisible else { return }
+        let gen = openGeneration
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.10
+            panel.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            Task { @MainActor in
+                guard let self, self.openGeneration == gen else { return }
+                self.panel.orderOut(nil)
+            }
+        })
+    }
+
     @objc func toggleLogin() {
         let service = SMAppService.mainApp
         do {
             if service.status == .enabled { try service.unregister() } else { try service.register() }
         } catch {
+            closePopover()
             let alert = NSAlert()
             alert.messageText = "로그인 시 자동 실행 (Launch at login)"
             alert.informativeText = error.localizedDescription
@@ -4079,12 +4265,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
     }
-    @objc func toggleSnow() { Settings.shared.snowOn.toggle(); engine.updateRate() }
-    @objc func toggleSnowmen() { Settings.shared.snowmenOn.toggle(); engine.applySettings() }
-    @objc func toggleAutoPlow() { Settings.shared.autoPlow.toggle() }
-    @objc func toggleFlakesOnTop() { Settings.shared.flakesOnTop.toggle(); engine.applySettings() }
-    @objc func toggleHideInFullscreen() { Settings.shared.hideInFullscreen.toggle(); engine.applySettings() }
-    @objc func setIntensity(_ i: NSMenuItem) { Settings.shared.intensity = Intensity(rawValue: i.tag) ?? .normal; engine.updateRate() }
     /// Not trusted yet: show the system Accessibility prompt once per build. A rebuilt (ad-hoc signed)
     /// binary loses the earlier grant, so the key is the executable's build time. The menu item stays.
     func askDockAccessOncePerBuild() {
@@ -4100,11 +4280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = AXIsProcessTrustedWithOptions(options)
         DockGeometry.invalidate()
     }
-    @objc func plowNow() { engine.startPlow() }
-    @objc func debugSpawn() { engine.spawnDemoSnowmen() }
-    @objc func clearSnow() { engine.clearSnow() }
     @MainActor @objc func checkForUpdates() { updater?.checkForUpdates() }
-    @MainActor @objc func toggleAutoUpdates() { updater?.automaticallyChecksForUpdates.toggle() }
     @objc func quit() { NSApp.terminate(nil) }
 }
 
@@ -4113,6 +4289,11 @@ let app = NSApplication.shared
 if let i = CommandLine.arguments.firstIndex(of: "--showcase") {
     let dir = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : "showcase-out"
     Showcase.run(outDir: dir)
+    exit(0)
+}
+if let i = CommandLine.arguments.firstIndex(of: "--render-popover") {
+    let dir = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : "popover-out"
+    MainActor.assumeIsolated { PopoverRenderer.renderAll(to: dir) }
     exit(0)
 }
 let delegate = AppDelegate()
