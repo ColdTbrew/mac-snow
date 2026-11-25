@@ -33,17 +33,48 @@
     }
     // fewer flakes on small screens; ~1 per 9000 px² at density 1
     const target = () => Math.round((W * H) / (W < 700 ? 14000 : 9000) * api.density);
+    // A pile is a height per 3px column across the element's width. When the width
+    // changes (resize, mobile rotation) the old heights are resampled, not dropped.
     function pileOf(el, w) {
       const n = Math.max(2, Math.ceil(w / 3));
       let p = piles.get(el);
-      if (!p || p.length !== n) {
+      if (p && p.length !== n) {
+        const q = new Float32Array(n);
+        for (let i = 0; i < n; i++) q[i] = p[Math.min(p.length - 1, Math.floor(i * p.length / n))];
+        piles.set(el, (p = q));
+      }
+      if (!p) {
         p = new Float32Array(n);
         const base = reduce ? Math.max(opt.prefill, 10) : opt.prefill;
-        if (base) for (let i = 0; i < n; i++) p[i] = base * (0.75 + 0.25 * Math.sin(i * 0.21 + (seed % 5)));
+        if (base) for (let i = 0; i < n; i++) p[i] = base;
         piles.set(el, p);
       }
       return p;
     }
+    const radii = new WeakMap();
+    function radiusOf(el) {
+      let r = radii.get(el);
+      if (r === undefined) { r = parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0; radii.set(el, r); }
+      return r;
+    }
+    // Shape of the element's top edge at distance d from the nearest side: how far the
+    // rounded corner drops below the flat top. 0 on the flat part, R at the very side.
+    function cornerDrop(d, R) {
+      if (d >= R) return 0;
+      const k = R - d;
+      return R - Math.sqrt(Math.max(0, R * R - k * k));
+    }
+    // How much of the pile survives at distance d from the side: 0 at the side, eased up
+    // to 1 a little past the corner, so the snow thins out over the rounded corner
+    // instead of overhanging it (same idea as the app's pile ends).
+    function envelope(d, R, w) {
+      const T = Math.min(w / 3, R + 18 + Math.min(40, w * 0.04));
+      if (d >= T) return 1;
+      const t = Math.max(0, d - R * 0.35) / (T - R * 0.35);
+      return t * t * (3 - 2 * t);
+    }
+    // Small fixed bumps so a full pile isn't a flat slab.
+    const bump = (i) => 0.84 + 0.1 * Math.sin(i * 0.37) + 0.06 * Math.sin(i * 1.13 + 1.7);
     function frame(now) {
       const dt = reduce ? 0 : Math.min(0.05, (now - last) / 1000); last = now;
       const want = target();
@@ -56,7 +87,7 @@
         const y = r.top - cr.top;
         if (y < -60 || y > H + 60 || r.width === 0) continue;
         rects.push({ el, x: r.left - cr.left, y, w: r.width,
-          max: Math.min(+(el.dataset.pileMax || 1e9), api.pileMax), p: pileOf(el, r.width) });
+          max: Math.min(+(el.dataset.pileMax || 1e9), api.pileMax), R: radiusOf(el), p: pileOf(el, r.width) });
       }
       ctx.clearRect(0, 0, W, H);
       const t = now / 1000;
@@ -73,7 +104,8 @@
           if (f.z > 0.55) for (const r of rects) {
             const p = r.p, i = Math.floor((nx - r.x) / 3);
             if (i < 0 || i >= p.length) continue;
-            const top = r.y - p[i];
+            const d = Math.min(nx - r.x, r.x + r.w - nx);
+            const top = r.y + cornerDrop(d, r.R) - Math.min(p[i], r.max * bump(i)) * envelope(d, r.R, r.w);
             if (f.y <= top && ny >= top) {
               if (p[i] < r.max) {
                 const add = 0.9 + f.r * 0.5;
@@ -94,12 +126,32 @@
       for (const r of rects) {
         const p = r.p, n = p.length;
         if (dt) for (let i = 1; i < n - 1; i++) { const avg = (p[i - 1] + p[i + 1]) / 2; if (p[i] > avg + 1.2) { const d = (p[i] - avg) * 0.25; p[i] -= d; p[i - 1] += d / 2; p[i + 1] += d / 2; } }
-        ctx.beginPath(); ctx.moveTo(r.x, r.y + 1);
-        for (let i = 0; i < n; i++) ctx.lineTo(r.x + i * 3, r.y - Math.min(p[i], r.max) * Math.min(1, i / 6, (n - 1 - i) / 6));
-        ctx.lineTo(r.x + r.w, r.y + 1); ctx.closePath();
+        // Outline: along the pile's top from the left side to the right side, then back
+        // along the element's own rounded top edge, so nothing is drawn outside its box.
+        const xs = [], top = [], base = [];
+        for (let i = 0; i <= n; i++) {
+          const dx = Math.min(i * 3, r.w);
+          const d = Math.min(dx, r.w - dx);
+          const b = r.y + cornerDrop(d, r.R);
+          const h = Math.min(p[Math.min(i, n - 1)], r.max * bump(i)) * envelope(d, r.R, r.w);
+          xs.push(r.x + dx); base.push(b); top.push(b - h);
+          if (dx >= r.w) break;
+        }
+        ctx.beginPath(); ctx.moveTo(xs[0], base[0]);
+        for (let i = 0; i < xs.length; i++) ctx.lineTo(xs[i], top[i]);
+        for (let i = xs.length - 1; i >= 0; i--) ctx.lineTo(xs[i], base[i] + 1.5);
+        ctx.closePath();
         const g = ctx.createLinearGradient(0, r.y - r.max, 0, r.y);
-        g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#dfe8f7');
-        ctx.fillStyle = g; ctx.shadowColor = 'rgba(20,30,70,.25)'; ctx.shadowBlur = 6; ctx.fill(); ctx.shadowBlur = 0;
+        g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#dde6f6');
+        ctx.fillStyle = g; ctx.fill();
+        ctx.strokeStyle = 'rgba(150,170,215,.55)'; ctx.lineWidth = 1;
+        // thin rim only where there is actually snow, so the bare corners get no outline
+        ctx.beginPath();
+        for (let i = 1; i < xs.length; i++) {
+          if (base[i] - top[i] < 0.6 || base[i - 1] - top[i - 1] < 0.6) continue;
+          ctx.moveTo(xs[i - 1], top[i - 1]); ctx.lineTo(xs[i], top[i]);
+        }
+        ctx.stroke();
       }
       ctx.fillStyle = `rgb(${opt.color})`;
     }
