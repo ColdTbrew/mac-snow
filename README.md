@@ -9,10 +9,13 @@
 
 - Swift + AppKit + Core Animation (+ [Sparkle 2](https://sparkle-project.org/) 자동 업데이트)
 - Xcode 없이 Command Line Tools만으로 빌드 (`tools/fetch_sparkle.sh`가 Sparkle 2 바이너리를 자동 다운로드·검증)
+- 소개 페이지는 `site/`(정적 HTML/CSS/JS)에 있고, main에 올라가면 `.github/workflows/pages.yml`이 GitHub Pages로 배포해요. 미리보기는 `cd site && python3 -m http.server`
 - 앱 아이콘 원본은 `Resources/AppIcon.svg`, `Resources/AppIcon.icns`는 `tools/make_icns.py`로 만들어요
 - Dock 아이콘 없이 메뉴바 ❄ 아이콘으로만 동작
 
 ## 다운로드
+
+🌐 **소개 페이지: https://coldtbrew.github.io/mac-snow/**
 
 **[최신 버전 받기 (DMG / ZIP)](https://github.com/ColdTbrew/mac-snow/releases/latest)**
 

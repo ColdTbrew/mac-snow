@@ -6,3 +6,4 @@ debug.txt
 !docs/*.png
 !Resources/dmg/background*.png
 showcase-out/
+!site/assets/*.png
