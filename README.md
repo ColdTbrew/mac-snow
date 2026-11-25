@@ -198,7 +198,7 @@ v0.5.1 유휴 비용 줄이기 전/후 (같은 맥, 화면 잠금 상태에서 `
 
 - 앱 코드는 `Sources/main.swift`, 가상 화면 렌더러는 `Sources/Showcase.swift`예요.
 - `open build/MacSnow.app --args --demo`로 실행하면 처음 25초 동안 눈이 빨리 쌓여요(확인용).
-- 배포 파일 만들기: `./tools/release.sh 0.5.2` → `dist/MacSnow-0.5.2.dmg`, `.zip`, `SHA256SUMS.txt` (애드혹 서명). `SPARKLE_PRIVATE_ED_KEY`가 있으면 ZIP을 EdDSA 서명해 `dist/appcast.xml`을 함께 만들고, 그 서명이 번들의 `SUPublicEDKey`로 검증되는지 `tools/verify_update_sig.swift`로 확인해요(안 맞으면 실패). `v*` 태그를 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 맥에서 빌드해 릴리스에 올리고, `appcast.xml`이 없으면 릴리스를 실패시켜요.
+- 배포 파일 만들기: `./tools/release.sh 0.5.2` → `dist/MacSnow-0.5.2.dmg`, `.zip`, `SHA256SUMS.txt` (애드혹 서명). DMG는 `dmgbuild`(`tools/fetch_dmgbuild.sh`가 `build/deps/dmgbuild`에 설치)로 만들어 눈 내리는 밤 배경(`Resources/dmg/`) 위에 앱과 Applications 폴더가 나란히 놓인 설치 창으로 열려요. 아이콘 좌표는 `tools/dmg_settings.py`에 있어요. `SPARKLE_PRIVATE_ED_KEY`가 있으면 ZIP을 EdDSA 서명해 `dist/appcast.xml`을 함께 만들고, 그 서명이 번들의 `SUPublicEDKey`로 검증되는지 `tools/verify_update_sig.swift`로 확인해요(안 맞으면 실패). `v*` 태그를 푸시하면 GitHub Actions(`.github/workflows/release.yml`)가 맥에서 빌드해 릴리스에 올리고, `appcast.xml`이 없으면 릴리스를 실패시켜요.
 - **Sparkle 자동 업데이트 키**: 공개 키는 `Info.plist`의 `SUPublicEDKey`에 들어 있어서 로컬 빌드도 업데이트 확인이 돼요(`SPARKLE_PUBLIC_ED_KEY` 환경 변수로 덮어쓸 수 있어요). 개인 키는 저장소 시크릿 `SPARKLE_PRIVATE_ED_KEY`에만 있어요. 키를 바꿔야 하면:
   1. `./tools/fetch_sparkle.sh` 후 `./build/deps/sparkle/bin/generate_keys --account mac-snow`로 키를 만들고(개인 키는 로그인 키체인에 저장), 출력된 공개 키로 `Info.plist`의 `SUPublicEDKey`를 바꿔요.
   2. `generate_keys --account mac-snow -x <임시 파일>`로 개인 키를 내보내 `gh secret set SPARKLE_PRIVATE_ED_KEY < <임시 파일>`로 등록하고 임시 파일은 바로 지워요. 개인 키를 화면이나 로그에 출력하지 마세요.
