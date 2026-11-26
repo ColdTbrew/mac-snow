@@ -45,7 +45,7 @@
     function step(dt, t) {
       // fire position: pointer or autopilot along the Finder window's snow
       let tx, ty;
-      if (pointer) { tx = pointer.x; ty = pointer.y - 11 * S(); }   // coals end ~10 s below the fire's center
+      if (pointer) { tx = pointer.x; ty = pointer.y - 11 * S(); }   // coals end ~10*S below the fire's center
       else {
         auto += dt;
         const w = wins[0];
