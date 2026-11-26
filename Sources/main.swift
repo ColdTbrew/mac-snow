@@ -682,41 +682,6 @@ func makePlowLayer(px: CGFloat) -> (CALayer, CGFloat) {
     return (root, 15 * px)
 }
 
-enum CampfireCursor {
-    private typealias CGSConnFn = @convention(c) () -> Int32
-    private typealias CGSSetPropFn = @convention(c) (Int32, Int32, CFString, CFTypeRef) -> CGError
-
-    private static let cgsMainConn: CGSConnFn? = {
-        guard let h = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
-              let p = dlsym(h, "CGSMainConnectionID") ?? dlsym(h, "_CGSDefaultConnection") else { return nil }
-        return unsafeBitCast(p, to: CGSConnFn.self)
-    }()
-    private static let cgsSetProp: CGSSetPropFn? = {
-        guard let h = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY),
-              let p = dlsym(h, "CGSSetConnectionProperty") else { return nil }
-        return unsafeBitCast(p, to: CGSSetPropFn.self)
-    }()
-
-    private(set) static var isHidden = false
-
-    static func setHidden(_ hide: Bool) {
-        guard hide != isHidden else { return }
-        if hide {
-            if let cid = cgsMainConn?(), cid != 0 {
-                _ = cgsSetProp?(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
-            }
-            CGDisplayHideCursor(CGMainDisplayID())
-            isHidden = true
-        } else {
-            CGDisplayShowCursor(CGMainDisplayID())
-            if let cid = cgsMainConn?(), cid != 0 {
-                _ = cgsSetProp?(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanFalse)
-            }
-            isHidden = false
-        }
-    }
-}
-
 enum CampfireAssets {
     /// Soft warm radial amber/orange glow halo behind the campfire.
     static let glowImage: CGImage? = {
@@ -1481,9 +1446,6 @@ final class Engine {
             DockGeometry.invalidate()
             self?.rebuildOverlays()
         }
-        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
-            CampfireCursor.setHidden(false)
-        }
         installMouseMonitors()
         installPowerObservers()
         startExposeWatch()
@@ -1644,7 +1606,6 @@ final class Engine {
             pauseWatch?.tolerance = 1
         }
         if p {
-            setCampfireCursorHidden(false)
             dropAllFlakes()
         }
         CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -1673,7 +1634,6 @@ final class Engine {
     }
 
     func rebuildOverlays() {
-        setCampfireCursorHidden(false)
         for o in overlays { o.window?.orderOut(nil); o.backWindow?.orderOut(nil) }
         dropAllFlakes()
         campfireVisual?.remove()
@@ -1697,7 +1657,6 @@ final class Engine {
             if virtualNow == nil { campfirePoint = NSEvent.mouseLocation }
         } else {
             campfireVel = .zero; campfireLastPoint = nil; campfireMelting = false
-            setCampfireCursorHidden(false)
         }
         for o in overlays { o.updateCollectionBehavior(hideInFullscreen: Settings.shared.hideInFullscreen) }
         if !Settings.shared.hideInFullscreen { setFullscreenOverlays([]) }
@@ -1852,7 +1811,6 @@ final class Engine {
     func applyOverlayVisibility(animated: Bool = true) {
         let showCampfire = campfirePoint.flatMap { campfireOverlay(at: $0) } != nil
         campfireVisual?.root.isHidden = !showCampfire
-        if !showCampfire { setCampfireCursorHidden(false) }
         for (i, o) in overlays.enumerated() {
             let fs = fullscreenOverlays.contains(i)
             let frontTo: Float = (expose || fs) ? 0 : 1
@@ -3371,11 +3329,6 @@ final class Engine {
 
     // MARK: campfire
 
-    private func setCampfireCursorHidden(_ hidden: Bool) {
-        guard virtualNow == nil else { return }
-        CampfireCursor.setHidden(hidden)
-    }
-
     private func isPointInOwnPopup(_ p: CGPoint) -> Bool {
         let popupLevel = Int(CGWindowLevelForKey(.popUpMenuWindow))
         return NSApp.windows.contains { w in
@@ -3398,12 +3351,15 @@ final class Engine {
         return o
     }
 
+    /// The fire sits just above the pointer's tip (coals/logs reach ~10 pt below the fire's center),
+    /// so the system arrow, which hangs down-right from its tip, stays fully visible.
+    var campfireLift: CGFloat { 11 * S }
+
     func updateCampfirePointer(at p: CGPoint) {
         guard Settings.shared.campfireOn, p.x.isFinite, p.y.isFinite else { return }
         campfirePoint = p
         guard let o = campfireOverlay(at: p) else {
             campfireVisual?.root.isHidden = true
-            setCampfireCursorHidden(false)
             return
         }
         CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -3415,8 +3371,7 @@ final class Engine {
             vis.parent = o.actors
         }
         vis.root.isHidden = false
-        vis.root.position = o.local(p)
-        setCampfireCursorHidden(true)
+        vis.root.position = o.local(CGPoint(x: p.x, y: p.y + campfireLift))
         CATransaction.commit()
     }
 
@@ -3429,7 +3384,6 @@ final class Engine {
         let active = Settings.shared.campfireOn && !paused && !expose && !overlays.isEmpty
         if !active {
             campfireVisual?.root.isHidden = true
-            setCampfireCursorHidden(false)
             campfireVel = .zero
             campfireLastPoint = nil
             campfireFlame = 1
@@ -3439,14 +3393,15 @@ final class Engine {
         if virtualNow == nil {
             campfirePoint = NSEvent.mouseLocation
         }
-        guard let p = campfirePoint, let o = campfireOverlay(at: p) else {
+        guard let cursor = campfirePoint, let o = campfireOverlay(at: cursor) else {
             campfireVisual?.root.isHidden = true
-            setCampfireCursorHidden(false)
             campfireVel = .zero
             campfireLastPoint = nil
             return
         }
 
+        // heat, sparks and the drawn fire all use the fire's spot, not the pointer tip
+        let p = CGPoint(x: cursor.x, y: cursor.y + campfireLift)
         if let prev = campfireLastPoint, dt > 0.001 {
             let raw = CGPoint(x: (p.x - prev.x) / dt, y: (p.y - prev.y) / dt)
             if hypot(raw.x, raw.y) >= 1050 * S {
@@ -3474,7 +3429,6 @@ final class Engine {
         }
         vis.root.isHidden = false
         vis.root.position = o.local(p)
-        setCampfireCursorHidden(true)
         campfirePhase += dt
         vis.update(phase: campfirePhase, velocity: campfireVel, flame: campfireFlame)
 

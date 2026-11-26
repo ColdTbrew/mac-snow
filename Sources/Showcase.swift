@@ -366,10 +366,31 @@ enum Showcase {
             cfSettings["campfireOn"] = true
             UserDefaults.standard.setVolatileDomain(cfSettings, forName: UserDefaults.argumentDomain)
             engine.applySettings()
+            // The system arrow pointer stays visible in campfire mode; macOS draws it above every window,
+            // so the stills composite one at the pointer tip (black with a white rim, tip at the hotspot).
+            let pointer = CAShapeLayer()
+            let arrow = CGMutablePath()
+            arrow.addLines(between: [CGPoint(x: 0, y: 0), CGPoint(x: 0, y: -17), CGPoint(x: 4, y: -13), CGPoint(x: 7, y: -19.5),
+                                     CGPoint(x: 9.6, y: -18.4), CGPoint(x: 6.7, y: -12.2), CGPoint(x: 12, y: -12.2)])
+            arrow.closeSubpath()
+            pointer.path = arrow
+            pointer.fillColor = NSColor.black.cgColor
+            pointer.strokeColor = NSColor.white.cgColor
+            pointer.lineWidth = 1.3
+            pointer.lineJoin = .round
+            pointer.zPosition = 5000
+            ov.actors.addSublayer(pointer)
+            func movePointer() {
+                CATransaction.begin(); CATransaction.setDisableActions(true)
+                pointer.position = engine.campfirePoint.map { ov.local($0) } ?? .zero
+                pointer.isHidden = engine.campfirePoint == nil
+                CATransaction.commit()
+            }
             var maxDrops = 0
             step(36) { i in
                 let k = CGFloat(i) / 35
                 engine.campfirePoint = CGPoint(x: surf.minX + 360 + 65 * k, y: surf.top + 10)
+                movePointer()
                 maxDrops = max(maxDrops, engine.meltDrops.count)
                 if i == 24 {
                     still("still-campfire-zoom", scale: 3, crop: CGRect(x: surf.minX + 290, y: surf.top - 115, width: 240, height: 175))
@@ -390,13 +411,20 @@ enum Showcase {
             }
             let dimmed = engine.campfireFlame
             precondition(dimmed < 0.2, "a fast shake should dim the campfire")
-            step(30) { _ in engine.campfirePoint = center }
+            step(30) { _ in engine.campfirePoint = center; movePointer() }
             precondition(engine.campfireFlame > 0.95, "the campfire should relight once the cursor stops")
+            still("still-campfire-cursor", scale: 4, crop: CGRect(x: center.x - 55, y: center.y - 40, width: 110, height: 95))
+            // the fire's lowest part (coals) must stay above the pointer tip, so the arrow is never under it
+            if let vis = engine.campfireVisual {
+                let fireBottom = vis.root.frame.minY + vis.coals.frame.minY + (vis.coals.path?.boundingBoxOfPath.minY ?? 0)
+                precondition(fireBottom >= ov.local(center).y - 0.5, "campfire coals should sit above the pointer tip")
+            }
             print("campfire shake: flame \(dimmed) -> \(engine.campfireFlame)")
             cfSettings["campfireOn"] = false
             UserDefaults.standard.setVolatileDomain(cfSettings, forName: UserDefaults.argumentDomain)
             engine.applySettings()
             engine.campfirePoint = nil
+            pointer.removeFromSuperlayer()
             precondition(engine.campfireVisual?.root.isHidden == true, "campfire visual should hide when turned off")
         }
 

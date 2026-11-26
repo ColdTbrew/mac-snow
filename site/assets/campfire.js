@@ -2,7 +2,8 @@
    Drawn after the app's CampfireVisual: warm glow, two crossed logs, glowing coals,
    three layered flames that lean against the motion, rising sparks; snow near the
    fire melts into steam and water drops that run down onto the window below.
-   - Pointer over the demo = the fire follows it (cursor hidden there). Otherwise it
+   - Pointer over the demo = the fire follows it, sitting just above the arrow's tip so the
+     pointer stays visible. Otherwise it
      drifts along the snow by itself.
    - Shake it hard and the flame dies down; hold still and it flares back up.
    - Animates only while on screen and the tab is visible, at ~30 fps.
@@ -44,7 +45,7 @@
     function step(dt, t) {
       // fire position: pointer or autopilot along the Finder window's snow
       let tx, ty;
-      if (pointer) { tx = pointer.x; ty = pointer.y; }
+      if (pointer) { tx = pointer.x; ty = pointer.y - 11 * S(); }   // coals end ~10*S below the fire's center
       else {
         auto += dt;
         const w = wins[0];
