@@ -1,6 +1,6 @@
-<img src="docs/icon-128.png" width="128" alt="MacSnow 아이콘" align="right">
+<p align="center"><img src="docs/icon-128.png" width="128" alt="MacSnow 아이콘"></p>
 
-# MacSnow ❄
+<h1 align="center">MacSnow ❄</h1>
 
 ![MacSnow 데모](docs/demo.gif)
 
