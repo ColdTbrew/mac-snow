@@ -152,13 +152,33 @@ enum Showcase {
             engine.refreshGeometry()
         }
         step(12, record: true)
-        // 8) snowplow pushes the Dock snow into a mound
+        // 8) snowplow pushes the Dock snow to the edge and pours it off the Dock
         engine.piles[Engine.dockKey(0)]?.fill()
         engine.startPlow()
-        var shot = false
-        step(30 * 7, record: true) { _ in
-            if !shot, let p = engine.plows.first, p.x > dockRect.midX + 40 { still("still-4-plow"); shot = true }
+        var shot = false, spillShot = false, edgeSpillPeak = 0
+        step(30 * 8, record: true) { _ in
+            if let dock = engine.surfaces[Engine.dockKey(0)] {
+                let nearEdge = engine.spills.filter { $0.fromDock && $0.pos.x >= dock.maxX - 10 }.count
+                edgeSpillPeak = max(edgeSpillPeak, nearEdge)
+                if let p = engine.plows.first {
+                    precondition(p.front <= dock.maxX + 8 * S, "plow front overhung Dock: \(p.front) vs \(dock.maxX)")
+                    if let box = p.mound.path?.boundingBoxOfPath, !box.isEmpty {
+                        precondition(box.maxX <= dock.maxX + 14 * S, "plow mound overhung Dock: \(box.maxX) vs \(dock.maxX)")
+                    }
+                    if !shot, p.x > dockRect.midX + 40 { still("still-4-plow"); shot = true }
+                    if !spillShot, (p.phase == .dumping || dock.maxX - p.front < 15) && nearEdge > 0 {
+                        still("still-4-plow-spill", scale: 2, crop: CGRect(x: dockRect.maxX - 180, y: 0, width: 280, height: 160))
+                        spillShot = true
+                    }
+                }
+            }
         }
+        precondition(spillShot, "expected still-4-plow-spill capture")
+        precondition(edgeSpillPeak >= 8, "expected snow to pour off Dock edge (peak=\(edgeSpillPeak))")
+        precondition(engine.plows.isEmpty, "expected snowplow to exit cleanly on the Dock")
+        let dockMeanAfterPlow = engine.piles[Engine.dockKey(0)]?.mean ?? 99
+        precondition(dockMeanAfterPlow < 0.5, "expected Dock snow cleared (mean=\(dockMeanAfterPlow))")
+        print("plow edge spill: peak=\(edgeSpillPeak), dockMean=\(dockMeanAfterPlow)")
         // 9) pick up a loose ball and stack it on the larger one (real mouse handlers).
         if let s = engine.surfaces[2] {
             let base = Prop(kind: .ball, scale: 7 * S)
