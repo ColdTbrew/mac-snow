@@ -1,6 +1,6 @@
 #!/bin/bash
 # 배포 파일 만들기: ./tools/release.sh 0.1.0 [빌드번호]
-# -> dist/MacSnow-<버전>.dmg, dist/MacSnow-<버전>.zip, dist/SHA256SUMS.txt
+# -> dist/MacSnow-<버전>.dmg(배경·아이콘 배치가 있는 설치 창), dist/MacSnow-<버전>.zip, dist/SHA256SUMS.txt
 #    (SPARKLE_PRIVATE_ED_KEY가 있으면 dist/appcast.xml도 함께 생성)
 # 애드혹 서명(개발자 ID 없음, 공증 안 함).
 set -euo pipefail
@@ -30,14 +30,14 @@ codesign -s - --force "$SPARKLE_FW"
 codesign -s - --force "$APP"
 codesign --verify --deep --strict "$APP"
 
-rm -rf dist && mkdir -p dist/dmg
+rm -rf dist && mkdir -p dist
 ZIP="dist/MacSnow-$VER.zip"
 DMG="dist/MacSnow-$VER.dmg"
 ditto -c -k --keepParent "$APP" "$ZIP"
-ditto "$APP" "dist/dmg/MacSnow.app"
-ln -s /Applications dist/dmg/Applications
-hdiutil create -volname "MacSnow $VER" -srcfolder dist/dmg -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
-rm -rf dist/dmg
+# DMG 창: 눈 내리는 밤 배경(1x+@2x를 한 TIFF로) 위에 앱과 Applications를 나란히 (tools/dmg_settings.py)
+./tools/fetch_dmgbuild.sh
+tiffutil -cathidpicheck Resources/dmg/background.png Resources/dmg/background@2x.png -out build/dmg-background.tiff >/dev/null
+build/deps/dmgbuild/bin/dmgbuild -s tools/dmg_settings.py -D app="$APP" -D bg=build/dmg-background.tiff "MacSnow $VER" "$DMG"
 (cd dist && shasum -a 256 "MacSnow-$VER.dmg" "MacSnow-$VER.zip" > SHA256SUMS.txt && cat SHA256SUMS.txt)
 
 if [ -n "${SPARKLE_PRIVATE_ED_KEY:-}" ]; then
@@ -45,6 +45,7 @@ if [ -n "${SPARKLE_PRIVATE_ED_KEY:-}" ]; then
   ZIP_LEN="$(stat -f%z "$ZIP")"
   PUB_DATE="$(LC_ALL=C date -u "+%a, %d %b %Y %H:%M:%S +0000")"
   ED_SIG="$(printf '%s' "$SPARKLE_PRIVATE_ED_KEY" | "$SPARKLE_DIR/bin/sign_update" --ed-key-file - -p "$ZIP")"
+  [ -n "$ED_SIG" ] || { echo "sign_update가 서명을 만들지 못했어요" >&2; exit 1; }
   cat > dist/appcast.xml <<EOF
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -69,6 +70,10 @@ if [ -n "${SPARKLE_PRIVATE_ED_KEY:-}" ]; then
   </channel>
 </rss>
 EOF
+  # 서명이 앱에 들어간 SUPublicEDKey로 검증되는지 확인 (키가 안 맞으면 업데이트가 거부돼요)
+  APP_PUB="$(/usr/libexec/PlistBuddy -c "Print :SUPublicEDKey" "$APP/Contents/Info.plist")"
+  [ -n "$APP_PUB" ] || { echo "SUPublicEDKey가 비어 있어요" >&2; exit 1; }
+  swift tools/verify_update_sig.swift "$APP_PUB" "$ZIP" "$ED_SIG"
   echo "generated dist/appcast.xml"
 else
   echo "note: SPARKLE_PRIVATE_ED_KEY is not set; skipping dist/appcast.xml generation."
