@@ -1650,7 +1650,11 @@ final class Engine {
     func applySettings() {
         updateMouseMoveMonitor()
         lastMelt = clock()
-        for v in pileViews.values { v.icicles.isHidden = !Settings.shared.meltOn }
+        if Settings.shared.meltOn {
+            geometryChanged = true
+        } else {
+            for v in pileViews.values { v.icicles.isHidden = true }
+        }
         if !Settings.shared.snowmenOn { removeAllProps() }
         if Settings.shared.campfireOn {
             rollCancel()
@@ -1679,9 +1683,9 @@ final class Engine {
 
     // MARK: geometry
 
-    /// Full window list (~1 ms on a busy desktop). During a drag we only re-read the dragged
-    /// window every frame (refreshDragged) and do the full list ~8 times a second.
-    func refreshGeometry() {
+    /// Full window list. During a confirmed drag, use this snapshot for reconciliation too,
+    /// before restoring the predicted frame for display.
+    func refreshGeometry(reconcilingDrag: Bool = false) {
         lastGeometryPoll = clock()
         var list = windowSource.fetch()
         geometryReads += 1
@@ -1690,6 +1694,11 @@ final class Engine {
         if expose { return }
         popupFrames = windowSource.popupFrames
         setFullscreenOverlays(detectFullscreenOverlays(wins: list))
+        if reconcilingDrag, let d = drag, d.confirmed {
+            if let frame = list.first(where: { $0.id == d.id })?.frame ?? windowSource.frame(of: d.id) {
+                reconcileDrag(with: frame)
+            }
+        }
         // while a title-bar drag is followed by prediction, the list's (older) frame mustn't pull it back
         if let d = drag, d.confirmed, let i = list.firstIndex(where: { $0.id == d.id }),
            let cur = wins.first(where: { $0.id == d.id }) {
@@ -1825,26 +1834,51 @@ final class Engine {
     /// Put the dragged window at `f` and move its snow + snowmen right now (no implicit animation).
     func moveDragged(to f: CGRect) {
         guard let d = drag, let i = wins.firstIndex(where: { $0.id == d.id }), wins[i].frame != f else { return }
-        var list = wins
-        list[i] = Win(id: d.id, frame: f, z: list[i].z, surface: list[i].surface)
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        applyWins(list)
-        redrawPiles(paths: false)
-        geometryChanged = false               // positions + masks are done; the tick needn't redo them
+        let old = wins[i]
+        let moved = Win(id: old.id, frame: f, z: old.z, surface: old.surface)
+        // Apply the predicted position now and let the run loop flush its layer changes together.
+        let actionsDisabled = CATransaction.disableActions()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.setDisableActions(actionsDisabled) }
+        let key = UInt64(d.id)
+        if !geometryChanged, fullscreenOverlays.isEmpty, surfaces[key] != nil, piles[key] != nil, old.frame.size == f.size {
+            wins[i] = moved
+            lastGeometryChange = clock()
+            logDraggedFrame(moved)
+            let surface = Surface(key: key, minX: f.minX, maxX: f.maxX, top: f.maxY, z: old.z)
+            surfaces[key] = surface
+            orderedSurfaces = surfaces.values.sorted { $0.top > $1.top }
+            let meltOn = Settings.shared.meltOn
+            // Only the moving pile and piles behind either position can change.
+            for surf in surfaces.values {
+                if surf.key != key {
+                    guard surf.z > old.z else { continue }
+                    let band = snowBand(surf)
+                    guard old.frame.intersects(band) || f.intersects(band) else { continue }
+                }
+                segments[surf.key] = visibleSegments(surf)
+                redrawPile(surf, paths: false, geometry: true, meltOn: meltOn)
+            }
+        } else {
+            var list = wins
+            list[i] = moved
+            applyWins(list)
+            redrawPiles(paths: false)
+            geometryChanged = false
+        }
         updateProps(dt: 0)
         updateRoll()
-        CATransaction.commit()
     }
 
     /// Compare the prediction with the window list. A difference > 2 pt that stays the same while the
     /// mouse holds still is a real offset (snapping, clamping): adopt it. While moving, the list may
     /// simply be behind, so never chase it then.
-    func reconcileDrag() {
-        guard var d = drag, d.confirmed, let f = windowSource.frame(of: d.id) else { return }
+    func reconcileDrag(with f: CGRect) {
+        guard var d = drag, d.confirmed else { return }
         let pr = d.predicted(d.p)
         let diff = CGSize(width: f.minX - pr.minX, height: f.minY - pr.minY)
         if lagLog != nil { lagWrite(String(format: "R %.6f %.2f %.2f", CACurrentMediaTime(), diff.width, diff.height)) }
-        if f.size != d.frame0.size { drag = nil; refreshGeometry(); return }     // it's being resized, not moved
+        if f.size != d.frame0.size { drag = nil; return }     // it's being resized, not moved
         if hypot(diff.width, diff.height) > 2 {
             if let pd = d.pendingDiff, d.pendingAt == d.p, hypot(diff.width - pd.width, diff.height - pd.height) < 1 {
                 d.bias.width += diff.width; d.bias.height += diff.height; d.pendingDiff = nil
@@ -1870,10 +1904,7 @@ final class Engine {
             lastGeometryChange = clock()
         }
         wins = list
-        if lagLog != nil, let id = downWin?.id, let w = list.first(where: { $0.id == id }), w.frame.origin != lagLast {
-            lagLast = w.frame.origin
-            lagWrite(String(format: "A %.6f %.2f %.2f %@", CACurrentMediaTime(), w.frame.minX, w.frame.minY, drag?.confirmed == true ? "pred" : "list"))
-        }
+        if lagLog != nil, let id = downWin?.id, let w = list.first(where: { $0.id == id }) { logDraggedFrame(w) }
         var s: [UInt64: Surface] = [:]
         for w in wins where w.surface {
             if overlays.indices.contains(where: { fullscreenOverlays.contains($0) && coversOverlay(w.frame, overlay: overlays[$0]) }) {
@@ -1911,6 +1942,12 @@ final class Engine {
         for k in surfaces.keys { piles[k]?.lastSeen = Date() }
     }
 
+    private func logDraggedFrame(_ w: Win) {
+        guard lagLog != nil, w.frame.origin != lagLast else { return }
+        lagLast = w.frame.origin
+        lagWrite(String(format: "A %.6f %.2f %.2f %@", CACurrentMediaTime(), w.frame.minX, w.frame.minY, drag?.confirmed == true ? "pred" : "list"))
+    }
+
     /// x-intervals (global) of a surface's top band that aren't hidden by windows in front of it.
     func visibleSegments(_ s: Surface) -> [(CGFloat, CGFloat)] {
         var segs: [(CGFloat, CGFloat)] = [(s.minX, s.maxX)]
@@ -1942,11 +1979,15 @@ final class Engine {
         let dt = CGFloat(min(0.25, now - last))
         last = now
 
-        // window bounds: mouse down -> the window under the cursor every frame (60 Hz) + full list
-        // ~8 Hz; otherwise the full list ~4 Hz after geometry changes, ~2 Hz when settled
+        // Confirmed drag: verify the prediction at ~15 Hz, half from the full window list.
+        // Other mouse-down activity checks one window per frame between full snapshots.
         if let d = drag, d.confirmed {
-            if tickCount % 4 == 0 { reconcileDrag() }          // ~15 Hz check against the window list
-            if tickCount % 8 == 0 { refreshGeometry() }
+            if tickCount % 8 == 0 {
+                refreshGeometry(reconcilingDrag: true)
+            } else if tickCount % 4 == 0, let frame = windowSource.frame(of: d.id) {
+                reconcileDrag(with: frame)
+                if drag == nil { refreshGeometry() }
+            }
         } else if mouseIsDown || forceFast {
             if tickCount % 8 == 0 { refreshGeometry() } else { refreshDragged() }
         } else if Settings.shared.campfireOn && now - lastGeometryPoll >= 0.25 {
@@ -2684,12 +2725,18 @@ final class Engine {
         return p
     }
 
+    private func snowBand(_ surf: Surface) -> CGRect {
+        let depth = max(Engine.windowCorner + 8, 24 * S)
+        return CGRect(x: surf.minX - 12, y: surf.top - depth, width: surf.width + 24,
+                      height: Pile.maxH + depth + 16)
+    }
+
     /// Clip region for a surface's snow: its band minus the rounded shapes of windows in front.
     /// Only recomputed when window geometry changes (boolean path ops are the expensive part).
     func clipPath(_ surf: Surface) -> CGPath? {
         guard surf.z > 0 else { return nil }
         let R = Engine.windowCorner
-        let band = CGRect(x: surf.minX - 12, y: surf.top - max(R + 8, 24 * S), width: surf.width + 24, height: Pile.maxH + max(R + 8, 24 * S) + 16)
+        let band = snowBand(surf)
         var occ: CGPath?
         for w in wins where w.z < surf.z && w.frame.intersects(band) {
             let rr = CGPath(roundedRect: w.frame, cornerWidth: R, cornerHeight: R, transform: nil)
@@ -2702,7 +2749,7 @@ final class Engine {
     /// Windows in front whose shape cuts this surface's snow, relative to the surface origin.
     func occluderSignature(_ surf: Surface) -> [CGRect] {
         guard surf.z > 0 else { return [] }
-        let band = CGRect(x: surf.minX - 12, y: surf.top - max(Engine.windowCorner + 8, 24 * S), width: surf.width + 24, height: Pile.maxH + max(Engine.windowCorner + 8, 24 * S) + 16)
+        let band = snowBand(surf)
         return wins.filter { $0.z < surf.z && $0.frame.intersects(band) }.map { $0.frame.offsetBy(dx: -surf.minX, dy: -surf.top) }
     }
 
@@ -2713,44 +2760,59 @@ final class Engine {
         for (k, view) in pileViews where surfaces[k] == nil || piles[k] == nil {
             view.container.removeFromSuperlayer(); pileViews[k] = nil
         }
-        for (k, surf) in surfaces {
-            guard let pile = piles[k], pile.heights.count > 1 else { continue }
-            let empty = (pile.mean <= 0.05 && !pile.icicles.contains { $0.length > 0 }) || (segments[k] ?? []).isEmpty
-            if empty { if let v = pileViews[k] { v.container.isHidden = true }; continue }
-            let view = pileViews[k] ?? PileView()
-            pileViews[k] = view
-            let o = overlays[overlayIndex(for: CGPoint(x: surf.minX + surf.width / 2, y: surf.top))]
-            if view.container.superlayer !== o.piles { o.piles.addSublayer(view.container) }
-            view.container.isHidden = false
-            view.container.zPosition = CGFloat(-surf.z)       // front windows' snow above back windows'
-            view.container.position = o.local(CGPoint(x: surf.minX, y: surf.top))
-            let toLocal = CGAffineTransform(translationX: -surf.minX, y: -surf.top)
-            let widthChanged = view.width != surf.width
-            if geometryChanged || widthChanged {
-                let sig = occluderSignature(surf)
-                if widthChanged || sig != view.occSig || view.width < 0 {
-                    view.occSig = sig
-                    if !sig.isEmpty, let c = clipPath(surf) {
-                        let band = c.boundingBoxOfPath
-                        view.mask.frame = band.applying(toLocal)
-                        view.mask.path = c.copy(using: [CGAffineTransform(translationX: -band.minX, y: -band.minY)])
-                        view.container.mask = view.mask
-                    } else { view.container.mask = nil }
-                }
+        let meltOn = Settings.shared.meltOn
+        for surf in surfaces.values {
+            redrawPile(surf, paths: paths, geometry: geometryChanged, meltOn: meltOn)
+        }
+    }
+
+    private func redrawPile(_ surf: Surface, paths: Bool, geometry: Bool, meltOn: Bool) {
+        let k = surf.key
+        guard let pile = piles[k], pile.heights.count > 1 else { return }
+        let empty = (pile.mean <= 0.05 && !pile.icicles.contains { $0.length > 0 }) || (segments[k] ?? []).isEmpty
+        if empty {
+            if let v = pileViews[k], !v.container.isHidden { v.container.isHidden = true }
+            return
+        }
+        let view = pileViews[k] ?? PileView()
+        pileViews[k] = view
+        let o = overlays[overlayIndex(for: CGPoint(x: surf.minX + surf.width / 2, y: surf.top))]
+        if view.container.superlayer !== o.piles { o.piles.addSublayer(view.container) }
+        if view.container.isHidden { view.container.isHidden = false }
+        let z = CGFloat(-surf.z)       // front windows' snow above back windows'
+        if view.container.zPosition != z { view.container.zPosition = z }
+        let position = o.local(CGPoint(x: surf.minX, y: surf.top))
+        if view.container.position != position { view.container.position = position }
+        let toLocal = CGAffineTransform(translationX: -surf.minX, y: -surf.top)
+        let widthChanged = view.width != surf.width
+        if geometry || widthChanged {
+            let sig = occluderSignature(surf)
+            if widthChanged || sig != view.occSig || view.width < 0 {
+                view.occSig = sig
+                if !sig.isEmpty, let c = clipPath(surf) {
+                    let band = c.boundingBoxOfPath
+                    view.mask.frame = band.applying(toLocal)
+                    view.mask.path = c.copy(using: [CGAffineTransform(translationX: -band.minX, y: -band.minY)])
+                    view.container.mask = view.mask
+                } else { view.container.mask = nil }
             }
-            view.icicles.isHidden = !Settings.shared.meltOn
-            if pile.icicleDirty || geometryChanged || widthChanged || view.needsPath {
+        }
+        if view.icicles.isHidden == meltOn { view.icicles.isHidden = !meltOn }
+        if meltOn && (pile.icicleDirty || geometry || widthChanged || view.needsPath) {
+            if pile.icicles.contains(where: { $0.length > 0 }) {
                 view.icicles.path = iciclePath(surf, pile)
-                pile.icicleDirty = false
+            } else if view.icicles.path != nil {
+                view.icicles.path = nil
             }
-            if paths && (pile.dirty || view.needsPath) || widthChanged {
-                pile.dirty = false; view.needsPath = false; view.width = surf.width
-                guard let gp = pilePath(surf, pile) else { continue }
-                view.top.path = gp.copy(using: [toLocal])
-                let under = gp.copy(using: [toLocal.translatedBy(x: 0, y: -1.2 * S)])
-                view.under.path = under
-                view.under.shadowPath = under
-            }
+            pile.icicleDirty = false
+        }
+        if paths && (pile.dirty || view.needsPath) || widthChanged {
+            pile.dirty = false; view.needsPath = false; view.width = surf.width
+            guard let gp = pilePath(surf, pile) else { return }
+            view.top.path = gp.copy(using: [toLocal])
+            let under = gp.copy(using: [toLocal.translatedBy(x: 0, y: -1.2 * S)])
+            view.under.path = under
+            view.under.shadowPath = under
         }
     }
 
