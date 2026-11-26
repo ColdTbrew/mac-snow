@@ -75,6 +75,28 @@ main{position:relative;z-index:10}
 .story .win .body{padding:0;position:relative;aspect-ratio:16/10}
 .story .win img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .5s}
 .story .win img.on{opacity:1}
+/* campfire */
+.fire{position:relative;padding:120px 40px 140px;overflow:hidden}
+.fire:before{content:"";position:absolute;left:50%;top:50%;width:1300px;height:900px;transform:translate(-30%,-50%);background:radial-gradient(closest-side,rgba(255,138,40,.30),rgba(255,90,20,.10) 55%,transparent);pointer-events:none}
+.fire .fire-in{position:relative;max-width:1200px;margin:0 auto;display:grid;grid-template-columns:1fr 1.25fr;gap:56px;align-items:center}
+.fire .badge{display:inline-flex;gap:6px;align-items:center;background:linear-gradient(90deg,#ff7a2f,#ffb347);color:#3a1600;border-radius:99px;padding:6px 14px;font-size:14px;font-weight:800}
+.fire h2{font-size:clamp(38px,4.4vw,60px);line-height:1.12;margin-top:16px}
+.fire h2 em{font-style:normal;color:#ffb35c;text-shadow:0 0 24px rgba(255,140,40,.55)}
+.fire .lead{font-size:19px;line-height:1.65;color:#ffe7cf;margin-top:16px}
+.fire ol{list-style:none;padding:0;margin:26px 0 0;display:grid;gap:12px}
+.fire li{display:flex;gap:14px;align-items:flex-start;background:rgba(255,160,80,.10);border:1px solid rgba(255,170,90,.25);border-radius:16px;padding:14px 16px;font-size:16px;line-height:1.55;color:#fff3e6}
+.fire li b.n{flex:none;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:#ff8a3d;color:#3a1600;font-size:14px}
+.fire .note{font-size:14px;color:#e8c9ad;margin-top:16px;line-height:1.6}
+.fire .win{box-shadow:0 30px 70px rgba(5,10,40,.5),0 0 90px rgba(255,120,30,.28),0 0 0 1px rgba(255,255,255,.4)}
+.fire .win .body{padding:0;position:relative}
+.fire canvas{display:block;width:100%;aspect-ratio:16/10;cursor:none;touch-action:pan-y}
+.fire .tiles{position:absolute;right:14px;top:14px;display:flex;gap:6px;padding:6px;border-radius:16px;background:rgba(30,32,48,.55);backdrop-filter:blur(14px);border:1px solid rgba(255,255,255,.18)}
+.fire .tile{width:62px;padding:7px 0 6px;border-radius:11px;text-align:center;font-size:11px;font-weight:700;color:#d9dcea;background:rgba(255,255,255,.08)}
+.fire .tile i{display:block;font-style:normal;font-size:18px;line-height:1.2}
+.fire .tile.on{background:linear-gradient(180deg,#ff9a4a,#ff6a1f);color:#fff;box-shadow:0 0 18px rgba(255,120,30,.6)}
+.fire .cap{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 14px;font-size:13px;color:#59607a;background:#f4f6fb;border-top:1px solid #e0e4ee}
+.fire .hint-t{display:none}@media (hover:none) and (pointer:coarse){.fire .hint-m{display:none}.fire .hint-t{display:inline}}
+.fire .cap button{all:unset;cursor:pointer;font-weight:700;color:#3f6be0;padding:4px 10px;border-radius:8px;background:#e6ecfb}
 /* features as desktop of windows */
 .desk{max-width:1200px;margin:0 auto;padding:120px 40px 140px}
 .desk>h2{font-size:clamp(38px,5vw,64px);text-align:center;line-height:1.15}
@@ -108,12 +130,13 @@ main{position:relative;z-index:10}
 .dock a[title]:hover:after{content:attr(title);position:absolute;bottom:72px;white-space:nowrap;background:rgba(20,26,60,.85);color:#fff;font-size:12px;padding:4px 10px;border-radius:8px}
 .dock .sep{width:1px;background:rgba(255,255,255,.4);margin:4px 2px}
 .reveal{opacity:0;transform:translateY(40px);transition:.8s cubic-bezier(.3,1.3,.5,1)}.reveal.in{opacity:1}
-.wins .reveal.in{transform:none}.wins .win.reveal.in:nth-child(3n+2){transform:translateY(34px)}
+.wins .reveal.in,.fire .reveal.in{transform:none}.wins .win.reveal.in:nth-child(3n+2){transform:translateY(34px)}
 @media (max-width:860px){
  .menubar .m{display:none}.moon{width:56px;height:56px;top:60px;right:20px}.meter{display:none}
  .hero{padding:80px 16px 130px}.hero .body{padding:30px 20px}.hero p{font-size:16px}
  .story{height:auto}.story .st{position:static;height:auto;grid-template-columns:1fr;padding:40px 16px}
  .bubbles{height:auto}.bub{position:static;opacity:1;transform:none}.bub:not(:first-child){display:none}
+ .fire{padding:80px 16px 100px}.fire .fire-in{grid-template-columns:1fr;gap:32px}.fire .lead{font-size:17px}.fire .tiles{right:8px;top:8px;transform:scale(.8);transform-origin:100% 0}
  .desk{padding:80px 16px}.wins{grid-template-columns:1fr;gap:40px}.wins .win:nth-child(3n+2),.wins .win.reveal.in:nth-child(3n+2){transform:none}
  .dock a{width:44px;height:44px;font-size:20px}.dock{gap:7px}
 }
@@ -124,7 +147,7 @@ main{position:relative;z-index:10}
 <body>
 <div class="moon" aria-hidden="true"></div><div class="hills" aria-hidden="true"></div>
 <canvas id="snow" aria-hidden="true"></canvas>
-<div class="menubar"><b>❄ MacSnow</b><a class="m" href="#story">둘러보기</a><a class="m" href="#features">기능</a><a class="m" href="https://github.com/ColdTbrew/mac-snow">GitHub</a><span class="sp"></span><span>❄</span><span class="m">12월 24일 (목) 오후 8:00</span></div>
+<div class="menubar"><b>❄ MacSnow</b><a class="m" href="#story">둘러보기</a><a class="m" href="#campfire">모닥불</a><a class="m" href="#features">기능</a><a class="m" href="https://github.com/ColdTbrew/mac-snow">GitHub</a><span class="sp"></span><span>❄</span><span class="m">12월 24일 (목) 오후 8:00</span></div>
 <div class="meter" aria-hidden="true">지금까지 쌓인 눈<b id="cm">0 cm</b></div>
 
 <main id="top">
@@ -157,6 +180,30 @@ main{position:relative;z-index:10}
   </div>
 </section>
 
+<section class="fire" id="campfire">
+  <div class="fire-in">
+    <div>
+      <span class="badge">🔥 모닥불 모드</span>
+      <h2 class="jua">커서가<br><em>모닥불</em>이 돼요</h2>
+      <p class="lead">장작 위에서 불꽃이 타오르는 모닥불을 들고 다녀요. 쌓인 눈 가까이 가져가면 열기에 사르르 녹아서 물방울로 흘러내려요.</p>
+      <ol>
+        <li><b class="n">1</b><span>메뉴바 ❄를 누르고 패널에서 <b>모닥불</b> 타일을 켜요.</span></li>
+        <li><b class="n">2</b><span>쌓인 눈·고드름·눈사람·눈덩이 가까이 가면 녹아요. 녹은 물은 창과 Dock 아래로 흘러내리다 아래 창에 닿으면 톡톡 튀어요.</span></li>
+        <li><b class="n">3</b><span>커서를 세게 흔들면 불꽃이 잠깐 잦아들고, 멈추면 다시 활활 타올라요.</span></li>
+      </ol>
+      <p class="note">모닥불이 켜져 있어도 클릭과 창 드래그는 평소처럼 돼요. 실수로 눈사람이 생기지 않게 제목줄 클릭 눈사람과 눈 굴리기만 잠시 쉬어요.</p>
+    </div>
+    <div class="win reveal" data-pile>
+      <div class="tb"><i></i><i></i><i></i><span>모닥불 체험</span></div>
+      <div class="body">
+        <canvas id="fire" role="img" aria-label="모닥불 커서가 창 위에 쌓인 눈을 녹여 물방울이 흘러내리는 데모"></canvas>
+        <div class="tiles" aria-hidden="true"><div class="tile on"><i>🔥</i>모닥불</div><div class="tile"><i>🚜</i>Dock 제설</div></div>
+        <div class="cap"><span class="hint-m">마우스를 올려 보세요. 흔들면 불꽃이 잦아들어요.</span><span class="hint-t">손가락으로 좌우로 끌어 보세요.</span><button type="button" id="refill">❄ 다시 쌓기</button></div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section class="desk" id="features">
   <h2 class="jua reveal">내 맘대로 조절하는 겨울</h2>
   <p class="reveal">메뉴바 ❄를 누르면 전부 바꿀 수 있어요.</p>
@@ -180,12 +227,13 @@ main{position:relative;z-index:10}
 
 <nav class="dock" aria-label="바로가기" data-pile>
   <a href="#" title="MacSnow" aria-label="맨 위로"><img src="assets/AppIcon.svg" alt="" width="56" height="56"></a>
-  <a href="#story" title="둘러보기" aria-label="둘러보기">🏔️</a><a href="#features" title="기능" aria-label="기능">⚙️</a><a href="#finale" title="눈사람" aria-label="눈사람">☃️</a>
+  <a href="#story" title="둘러보기" aria-label="둘러보기">🏔️</a><a href="#campfire" title="모닥불 모드" aria-label="모닥불 모드">🔥</a><a href="#features" title="기능" aria-label="기능">⚙️</a><a href="#finale" title="눈사람" aria-label="눈사람">☃️</a>
   <span class="sep"></span>
   <a href="https://github.com/ColdTbrew/mac-snow" title="GitHub" aria-label="GitHub"><svg width="30" height="30" viewBox="0 0 16 16" fill="#1d2340"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8"/></svg></a><a data-dl href="https://github.com/ColdTbrew/mac-snow/releases/latest" title="다운로드" aria-label="다운로드">⬇️</a>
 </nav>
 
 <script src="assets/snow.js"></script>
+<script src="assets/campfire.js"></script>
 <script>
 const SHOT=new URLSearchParams(location.search).has('shot');
 const s=MacSnow.snow(document.getElementById('snow'),{density:1.1,pile:true,pileMax:10,prefill:SHOT?8:0});
@@ -202,6 +250,7 @@ function tick(){
   [man.querySelector('.b1'),man.querySelector('.b2'),man.querySelector('.b3'),man.querySelector('.scarf'),man.querySelector('.hat')].forEach((e,k)=>e.style.setProperty('--s',q>k*.18?1:0));
 }
 addEventListener('scroll',tick,{passive:true});tick();
+const cf=MacSnowCampfire(document.getElementById('fire'));document.getElementById('refill').onclick=()=>cf.refill();
 MacSnow.reveal();MacSnow.wireDownload();
 </script>
 </body>
