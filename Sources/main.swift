@@ -87,8 +87,6 @@ protocol WindowProvider {
     func exists(_ id: CGWindowID) -> Bool
     /// Mission Control (or Launchpad) is showing, as of the last fetch: window frames are scaled thumbnails
     var exposeActive: Bool { get }
-    /// Frames of regular app windows covering an entire screen (e.g. fullscreen video / apps).
-    var fullscreenFrames: [CGRect] { get }
     /// Frames of external popup / context menu windows.
     var popupFrames: [CGRect] { get }
 }
@@ -96,14 +94,12 @@ extension WindowProvider {
     /// The window still exists (maybe on another Space, minimized or hidden), i.e. it wasn't closed.
     func exists(_ id: CGWindowID) -> Bool { frame(of: id) != nil }
     var exposeActive: Bool { false }
-    var fullscreenFrames: [CGRect] { [] }
     var popupFrames: [CGRect] { [] }
 }
 
 struct SystemWindows: WindowProvider {
     func fetch() -> [Win] { WindowList.fetch() }
     var exposeActive: Bool { WindowList.exposeActive }
-    var fullscreenFrames: [CGRect] { WindowList.fullscreenFrames }
     var popupFrames: [CGRect] { WindowList.popupFrames }
     /// Minimized windows and windows on other Spaces only show up in the full list (not in a
     /// single-window query), so look there. Called rarely (missing windows, ≤ every 2 s each).
@@ -130,7 +126,6 @@ final class SimOverride: WindowProvider {
     func frame(of id: CGWindowID) -> CGRect? { frames[id] ?? SystemWindows().frame(of: id) }
     func exists(_ id: CGWindowID) -> Bool { frames[id] != nil || SystemWindows().exists(id) }
     var exposeActive: Bool { WindowList.exposeActive }
-    var fullscreenFrames: [CGRect] { WindowList.fullscreenFrames }
     var popupFrames: [CGRect] { WindowList.popupFrames }
 }
 
@@ -138,13 +133,8 @@ enum WindowList {
     /// Mission Control puts a full-screen shield window (WindowManager, layer 19 on macOS 14+; the Dock
     /// on older systems) over the desktop. Owner names and layers need no screen-recording permission.
     static var exposeActive = false
-    static var fullscreenFrames: [CGRect] = []
     static var popupFrames: [CGRect] = []
     static let exposeLayers = 18...19
-    private static let systemOwners: Set<String> = [
-        "Window Server", "WindowManager", "Dock", "loginwindow", "ControlCenter",
-        "NotificationCenter", "Wallpaper", "Spotlight", "ScreenSaverEngine", "SystemUIServer"
-    ]
     static func fetch() -> [Win] {
         guard let raw = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return [] }
         let screens = NSScreen.screens
@@ -152,28 +142,12 @@ enum WindowList {
         let me = ProcessInfo.processInfo.processIdentifier
         let popupLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
         var out: [Win] = []
-        var fsFrames: [CGRect] = []
         var popups: [CGRect] = []
         let screenArea = screens.map { $0.frame.width * $0.frame.height }.max() ?? 1
         var expose = false
         defer {
             exposeActive = expose
-            fullscreenFrames = fsFrames
             popupFrames = popups
-        }
-        var menuBarScreens = Set<Int>()
-        for info in raw {
-            let layer = info[kCGWindowLayer as String] as? Int ?? -1
-            let owner = info[kCGWindowOwnerName as String] as? String
-            guard owner == "Window Server", layer == 24,
-                  let b = info[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
-            let w = b["Width"] ?? 0, h = b["Height"] ?? 0
-            guard w > 200, h > 10, h < 80 else { continue }
-            let x = b["X"] ?? 0, y = b["Y"] ?? 0
-            let rect = CGRect(x: x, y: primaryH - y - h, width: w, height: h)
-            for (idx, sc) in screens.enumerated() where abs(rect.minX - sc.frame.minX) <= 4 && abs(rect.maxY - sc.frame.maxY) <= 4 {
-                menuBarScreens.insert(idx)
-            }
         }
         for info in raw {
             let layer = info[kCGWindowLayer as String] as? Int ?? -1
@@ -196,23 +170,56 @@ enum WindowList {
             }
             guard w >= 80, h >= 50 else { continue }
             let rect = CGRect(x: x, y: primaryH - y - h, width: w, height: h)
-            if alpha >= 0.9, let pid = info[kCGWindowOwnerPID as String] as? Int32,
-               !(owner.map { systemOwners.contains($0) } ?? false) {
-                let coversScreen = screens.enumerated().contains { idx, sc in
-                    let f = sc.frame
-                    let allowedTopInset: CGFloat = menuBarScreens.contains(idx) ? 2 : max(2, sc.safeAreaInsets.top + 2)
-                    return rect.minX <= f.minX + 2 && rect.maxX >= f.maxX - 2 &&
-                           rect.minY <= f.minY + 2 && rect.maxY >= f.maxY - allowedTopInset
-                }
-                if coversScreen, NSRunningApplication(processIdentifier: pid)?.activationPolicy == .regular {
-                    fsFrames.append(rect)
-                }
-            }
             guard layer < 20 else { continue }
             if layer > 0 && w * h > screenArea * 0.8 { continue }   // full-screen helper overlays
             out.append(Win(id: id, frame: rect, z: out.count, surface: layer == 0))
         }
         return out
+    }
+}
+
+/// The WindowServer owns the active Space type. AppKit doesn't expose the type of
+/// another app's Space, so load SkyLight at runtime and tolerate missing symbols or data.
+private enum DisplaySpaces {
+    private typealias Connection = @convention(c) () -> Int32
+    private typealias CopySpaces = @convention(c) (Int32) -> Unmanaged<CFArray>?
+    private static let read: (() -> [Any])? = {
+        guard let library = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY) else {
+            return nil
+        }
+        guard let connection = dlsym(library, "CGSMainConnectionID"),
+              let copy = dlsym(library, "CGSCopyManagedDisplaySpaces") else {
+            dlclose(library)
+            return nil
+        }
+        let connectionID = unsafeBitCast(connection, to: Connection.self)
+        let copySpaces = unsafeBitCast(copy, to: CopySpaces.self)
+        return { copySpaces(connectionID())?.takeRetainedValue() as? [Any] ?? [] }
+    }()
+
+    static func fullscreenStates(for displays: [CGDirectDisplayID]) -> [CGDirectDisplayID: Bool] {
+        guard !displays.isEmpty, let spaces = read?() else { return [:] }
+        var states: [String: Bool] = [:]
+        for case let entry as [String: Any] in spaces {
+            guard let identifier = entry["Display Identifier"] as? String,
+                  let active = entry["Current Space"] as? [String: Any],
+                  let type = active["type"] as? Int else { continue }
+            states[identifier.uppercased()] = type == 4 // native full-screen Space, including Split View
+        }
+        // With a single shared Space, WindowServer uses "Main" instead of a display UUID.
+        if spaces.count == 1, let shared = states["MAIN"] {
+            return Dictionary(displays.map { ($0, shared) }, uniquingKeysWith: { first, _ in first })
+        }
+        var result: [CGDirectDisplayID: Bool] = [:]
+        for display in displays {
+            if display == CGMainDisplayID(), let main = states["MAIN"] {
+                result[display] = main
+            } else if let uuid = CGDisplayCreateUUIDFromDisplayID(display)?.takeRetainedValue() {
+                let identifier = CFUUIDCreateString(nil, uuid) as String
+                result[display] = states[identifier.uppercased()]
+            }
+        }
+        return result
     }
 }
 
@@ -1049,6 +1056,10 @@ final class Overlay {
         if top { backWindow?.orderOut(nil) } else { backWindow?.orderFrontRegardless() }
     }
 
+    var displayID: CGDirectDisplayID? {
+        (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
     func local(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x - frame.minX, y: p.y - frame.minY) }
 }
 
@@ -1607,6 +1618,8 @@ final class Engine {
         }
         if p {
             dropAllFlakes()
+        } else {
+            refreshFullscreenState(force: true)
         }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         applyOverlayVisibility(animated: false)
@@ -1639,6 +1652,7 @@ final class Engine {
         campfireVisual?.remove()
         campfireVisual = nil
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
+        refreshFullscreenState(force: true)
         applyOverlayVisibility(animated: false)
         pileViews.removeAll()
         for p in props { p.remove(); p.parent = nil }
@@ -1663,7 +1677,7 @@ final class Engine {
             campfireVel = .zero; campfireLastPoint = nil; campfireMelting = false
         }
         for o in overlays { o.updateCollectionBehavior(hideInFullscreen: Settings.shared.hideInFullscreen) }
-        if !Settings.shared.hideInFullscreen { setFullscreenOverlays([]) }
+        refreshFullscreenState(force: true)
         CATransaction.begin(); CATransaction.setDisableActions(true)
         applyOverlayVisibility(animated: false)
         for o in overlays { o.setFlakesOnTop(Settings.shared.flakesOnTop) }
@@ -1693,7 +1707,7 @@ final class Engine {
         // Mission Control: windows are shrunk thumbnails; keep the real geometry (and the snow) as it was
         if expose { return }
         popupFrames = windowSource.popupFrames
-        setFullscreenOverlays(detectFullscreenOverlays(wins: list))
+        refreshFullscreenState()
         if reconcilingDrag, let d = drag, d.confirmed {
             if let frame = list.first(where: { $0.id == d.id })?.frame ?? windowSource.frame(of: d.id) {
                 reconcileDrag(with: frame)
@@ -1710,6 +1724,8 @@ final class Engine {
     /// Mission Control is up: fade all the snow on windows / the Dock out, and back in when it closes.
     var expose = false
     var fullscreenOverlays = Set<Int>()
+    private var fullscreenStates: [CGDirectDisplayID: Bool] = [:]
+    private var lastFullscreenCheck: CFTimeInterval = -.infinity
     var spaceChecks: [DispatchWorkItem] = []
 
     func scheduleSpaceRefresh() {
@@ -1719,6 +1735,7 @@ final class Engine {
             let item = DispatchWorkItem { [weak self] in
                 guard let self, !self.paused else { return }
                 CATransaction.begin(); CATransaction.setDisableActions(true)
+                self.refreshFullscreenState(force: true)
                 self.refreshGeometry()
                 CATransaction.commit()
             }
@@ -1727,33 +1744,27 @@ final class Engine {
         }
     }
 
-    func coversOverlay(_ rect: CGRect, overlay o: Overlay) -> Bool {
-        let f = o.frame
-        return rect.minX <= f.minX + 2 && rect.maxX >= f.maxX - 2 &&
-               rect.minY <= f.minY + 2 && rect.maxY >= f.maxY - 2
-    }
-
-    func detectFullscreenOverlays(wins list: [Win]) -> Set<Int> {
-        guard Settings.shared.hideInFullscreen else { return [] }
-        let fsFrames = windowSource.fullscreenFrames
-        var result = Set<Int>()
-        for (i, o) in overlays.enumerated() {
-            if let w = o.window, !w.isOnActiveSpace {
-                result.insert(i); continue
-            }
-            if fsFrames.contains(where: { r in
-                let f = o.frame
-                let topInset = o.screen.map { max(2, $0.safeAreaInsets.top + 2) } ?? 2
-                return r.minX <= f.minX + 2 && r.maxX >= f.maxX - 2 &&
-                       r.minY <= f.minY + 2 && r.maxY >= f.maxY - topInset
-            }) {
-                result.insert(i); continue
-            }
-            if list.contains(where: { coversOverlay($0.frame, overlay: o) }) {
-                result.insert(i)
+    private func refreshFullscreenState(force: Bool = false) {
+        guard virtualNow == nil else { return }
+        guard Settings.shared.hideInFullscreen else {
+            setFullscreenOverlays([])
+            return
+        }
+        let now = clock()
+        // Space notifications refresh immediately. Throttle the backup check independently
+        // from window geometry polling, which can run several times per second during a drag.
+        if force || now - lastFullscreenCheck >= 2 {
+            lastFullscreenCheck = now
+            fullscreenStates = DisplaySpaces.fullscreenStates(for: overlays.compactMap(\.displayID))
+        }
+        var hidden = Set<Int>()
+        for (i, overlay) in overlays.enumerated() {
+            let native = overlay.displayID.flatMap { fullscreenStates[$0] }
+            if native ?? (overlay.window?.isOnActiveSpace == false) {
+                hidden.insert(i)
             }
         }
-        return result
+        setFullscreenOverlays(hidden)
     }
 
     func isFullscreen(at p: CGPoint) -> Bool {
@@ -1907,7 +1918,9 @@ final class Engine {
         if lagLog != nil, let id = downWin?.id, let w = list.first(where: { $0.id == id }) { logDraggedFrame(w) }
         var s: [UInt64: Surface] = [:]
         for w in wins where w.surface {
-            if overlays.indices.contains(where: { fullscreenOverlays.contains($0) && coversOverlay(w.frame, overlay: overlays[$0]) }) {
+            // Route piles to their display, whose visibility was already decided by the Space state.
+            if !fullscreenOverlays.isEmpty,
+               fullscreenOverlays.contains(overlayIndex(for: CGPoint(x: w.frame.midX, y: w.frame.maxY))) {
                 continue
             }
             s[UInt64(w.id)] = Surface(key: UInt64(w.id), minX: w.frame.minX, maxX: w.frame.maxX, top: w.frame.maxY, z: w.z)
@@ -4160,7 +4173,7 @@ final class Engine {
         let settings = Settings.shared
         out += "settings intensity=\(settings.intensity.rawValue) wind=\(settings.windOn)/\(settings.windStrength) melt=\(settings.meltOn)/\(settings.meltSpeed) campfire=\(settings.campfireOn) battery=\(settings.batteryMode.rawValue) lowPower=\(lowPower) onAC=\(onAC) lpm=\(ProcessInfo.processInfo.isLowPowerModeEnabled) login=\(SMAppService.mainApp.status.rawValue)\n"
         out += "wind gusts=\(windGusts) pushed=\(windPushed) dust=\(windDust) campfireDrops=\(meltDrops.count) campfireSparks=\(campfireSparks.count)\n"
-        out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) lastGeometryChange age=\(clock() - lastGeometryChange) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1) fullscreen=\(fullscreenOverlays.sorted()) hideFS=\(settings.hideInFullscreen)\n"
+        out += "occlusion=\(occlusionEvents) geometryReads=\(geometryReads) lastGeometryChange age=\(clock() - lastGeometryChange) ticks=\(tickCount) expose=\(expose) at=\(exposeAt) clipOpacity=\(overlays.first?.clip.opacity ?? -1) backClipOpacity=\(overlays.first?.backClip.opacity ?? -1) fullscreen=\(fullscreenOverlays.sorted()) hideFS=\(settings.hideInFullscreen)\n"
         out += "shake on=\(settings.shakeOn) strength=\(settings.shakeStrength.rawValue) jolts=\(shakeJolts) sheds=\(shakeSheds) drags=\(dragCount)\n"
         for (k, p) in piles where k < Engine.dockKey(0) {
             let lengths = p.icicles.map(\.length).filter { $0 > 0 }
